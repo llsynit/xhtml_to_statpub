@@ -5531,12 +5531,251 @@ def _find_numbered_p_run(anchor: Tag) -> list[Tag]:
         return run
     return []
 
+# --- Hjelpere for 2.5.1.18 ----------------------------------------------------
+
+_TASKISH_TOKENS = {
+    "assessment","assessments","exercise","exercises",
+    "practice","task","tasks","question","questions","key","fasit"
+}
+
+_BLOCK_TAGS = {
+    "address","article","aside","blockquote","caption","center","div","dl","dt","dd","figure","figcaption",
+    "footer","form","h1","h2","h3","h4","h5","h6","header","hr","li","main","nav","ol","p","pre","section",
+    "table","tbody","thead","tfoot","tr","td","th","ul","video","audio","canvas","math"
+}
+
+def _epub_types(el: Tag) -> set[str]:
+    t = (el.get("epub:type") or "").lower()
+    return set(t.replace(";", " ").replace(",", " ").split()) if t else set()
+
+def _is_task_container(el: Tag) -> bool:
+    if not getattr(el, "name", None): return False
+    cls = set(el.get("class", []) or [])
+    if "task" in cls or "key" in cls: return True
+    return bool(_epub_types(el) & _TASKISH_TOKENS)
+
+def _text(n) -> str:
+    if n is None: return ""
+    if isinstance(n, NavigableString): return str(n)
+    return n.get_text(" ", strip=True) or ""
+
+def _rows(tbl: Tag): return tbl.find_all("tr", recursive=False)
+def _cells(tr: Tag): return tr.find_all(["td","th"], recursive=False)
+
+def _is_inline_only(tag: Tag) -> bool:
+    for d in tag.descendants:
+        if isinstance(d, Tag) and d.name in _BLOCK_TAGS and d is not tag:
+            return False
+    return True
+
+def _is_simple_layout_table(tbl: Tag, *, aggressive=False) -> tuple[bool, list[str], list[list[str]]]:
+    """
+    Returnerer (ok, headers, rows) for tabeller som egner seg å konvertere til liste.
+    - 2–4 kolonner, minst 2 rader.
+    - celler med primært inline-innhold, ikke “tunge” blokker.
+    - 'aggressive': senker terskler (tillater litt lengre celler osv.).
+    """
+    trs = _rows(tbl)
+    if len(trs) < 2:
+        return False, [], []
+
+    # finn antall kolonner
+    ncols = max((len(_cells(tr)) for tr in trs), default=0)
+    if ncols < 2 or ncols > 4:
+        return False, [], []
+
+    # skiln header/body
+    header = None
+    if any(c.name == "th" for c in _cells(trs[0])):
+        header = trs[0]
+        body = trs[1:]
+    else:
+        body = trs
+
+    # tom/for kort body?
+    if len(body) < 1:
+        return False, [], []
+
+    headers = []
+    if header:
+        for c in _cells(header):
+            headers.append(_text(c).strip())
+
+    # valider innholdsceller
+    rows = []
+    max_cell_len = 160 if not aggressive else 280
+    for tr in body:
+        cs = _cells(tr)
+        if not cs: 
+            continue
+        row = []
+        for c in cs:
+            if not _is_inline_only(c):
+                return False, [], []  # inneholder blokkelementer → sannsynlig data-tabell
+            t = re.sub(r"\s+", " ", _text(c)).strip()
+            if len(t) > max_cell_len and not aggressive:
+                return False, [], []  # veldig lange celler → sannsynlig data-tabell
+            row.append(t)
+        # minst én celle bør ha tekst
+        if any(s for s in row):
+            rows.append(row)
+
+    if len(rows) < 2 and not aggressive:
+        return False, [], []
+
+    return True, headers, rows
+
+def _existing_table_as_list(node_after: Tag) -> Tag | None:
+    nxt = node_after.next_sibling
+    while isinstance(nxt, NavigableString) and not nxt.strip():
+        nxt = nxt.next_sibling
+    if isinstance(nxt, Tag) and nxt.name in {"ol","ul"}:
+        classes = set(nxt.get("class", []) or [])
+        if "table-as-list" in classes:
+            return nxt
+    return None
+
+def _make_head_p(soup, headers: list[str]) -> Tag:
+    p = soup.new_tag("p")
+    p["class"] = ["table-as-list-head"]
+    # spesifikasjonen: bruk semikolon + blank
+    p.string = "; ".join(h for h in headers if h.strip())
+    return p
+
+def _make_ul_from_rows(soup, rows: list[list[str]]) -> Tag:
+    ul = soup.new_tag("ul")
+    ul["class"] = ["list-unstyled", "table-as-list"]
+    for row in rows:
+        # spesifikasjonen: separer kolonner med '; '
+        content = "; ".join([s for s in row if s])
+        if not content:
+            continue
+        li = soup.new_tag("li")
+        li.append(NavigableString(content))
+        ul.append(li)
+    return ul
+
+# --- Hjelpere for 2.5.1.19 ----------------------------------------------------
+
+_TASKISH_TOKENS = {
+    "assessment","assessments","exercise","exercises",
+    "practice","task","tasks","question","questions","key","fasit"
+}
+
+_BLOCK_TAGS = {
+    "address","article","aside","blockquote","caption","center","div","dl","dt","dd","figure","figcaption",
+    "footer","form","h1","h2","h3","h4","h5","h6","header","hr","li","main","nav","ol","p","pre","section",
+    "table","tbody","thead","tfoot","tr","td","th","ul","video","audio","canvas","math"
+}
+
+def _epub_types(el: Tag) -> set[str]:
+    t = (el.get("epub:type") or "").lower()
+    return set(t.replace(";", " ").replace(",", " ").split()) if t else set()
+
+def _is_task_container(el: Tag) -> bool:
+    if not getattr(el, "name", None): return False
+    cls = set(el.get("class", []) or [])
+    if "task" in cls or "key" in cls: return True
+    return bool(_epub_types(el) & _TASKISH_TOKENS)
+
+def _text(n) -> str:
+    if n is None: return ""
+    if isinstance(n, NavigableString): return str(n)
+    return n.get_text(" ", strip=True) or ""
+
+def _is_inline_only(tag: Tag) -> bool:
+    for d in tag.descendants:
+        if isinstance(d, Tag) and d.name in _BLOCK_TAGS and d is not tag:
+            return False
+    return True
+
+def _first_sig_child(tag: Tag):
+    for c in tag.contents:
+        if isinstance(c, NavigableString) and not c.strip():
+            continue
+        return c
+    return None
+
+def _collect_between_siblings(parent: Tag, left: Tag, right: Tag):
+    """
+    Samle *alle* noder som ligger mellom left<li> og right<li> som er egnet som 'mellomtekst'.
+    Tillater <p> (inline-only), <br>, og rent inline (span/em/strong/i/b/a/img osv.)/tekst.
+    """
+    out = []
+    cur = left.next_sibling
+    allowed_inline = {"span","em","strong","i","b","u","a","img","sup","sub","code","kbd","s","small","mark"}
+    while cur is not None and cur is not right:
+        nxt = cur.next_sibling
+        if isinstance(cur, NavigableString):
+            if cur.strip():
+                out.append(cur)
+            else:
+                # ignorer ren whitespace
+                pass
+        elif isinstance(cur, Tag):
+            nm = cur.name
+            if nm == "p" and _is_inline_only(cur):
+                out.append(cur)
+            elif nm == "br":
+                out.append(cur)
+            elif nm in allowed_inline:
+                out.append(cur)
+            else:
+                # blokker/lister/figure osv. lar vi stå (ikke mellomtekst)
+                pass
+        cur = nxt
+    return out
+
+def _wrap_into_paragraphs(soup, nodes: list):
+    """
+    Lag en liste av <p> fra 'nodes'.
+    - Eksisterende <p> beholdes som egne avsnitt (flyttes).
+    - Inline/tekst grupperes til <p>, og <br> avslutter gjeldende avsnitt.
+    """
+    paras = []
+    buffer_inline = []
+
+    def flush_buffer():
+        nonlocal buffer_inline, paras
+        if buffer_inline:
+            p = soup.new_tag("p")
+            for n in buffer_inline:
+                p.append(n)
+            paras.append(p)
+            buffer_inline = []
+
+    for n in nodes:
+        if isinstance(n, Tag) and n.name == "p":
+            flush_buffer()
+            paras.append(n)  # flytt hele <p> som den er
+        elif isinstance(n, Tag) and n.name == "br":
+            flush_buffer()
+            # <br> blir ikke beholdt; den fungerer bare som avsnittsskille
+            try:
+                n.decompose()
+            except Exception:
+                pass
+        else:
+            # inline/tekst
+            # sørg for at n er frakoblet før vi legger i buffer
+            try:
+                n.extract()
+            except Exception:
+                pass
+            buffer_inline.append(n if isinstance(n, Tag) else NavigableString(str(n)))
+
+    flush_buffer()
+    # fjern tomme <p>
+    paras = [p for p in paras if p.get_text("", strip=True)]
+    return paras
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     logger.info('Applying Statped Mark-up Requirements')
 
     use_llm = args.llm
+    agressive = args.aggressive
 
     try:
         args.grade = int(args.grade)
@@ -9663,14 +9902,146 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
     # 2.5.1.18 Tasks with tables better represented as lists
     # TODO: make parameter option
+    """
+    2.5.1.18 Tasks with tables better represented as lists
+    - Inne i oppgaver: konverter enkle layout-tabeller til <ul class="list-unstyled table-as-list">.
+    - Radene blir <li>, cellene sammenføyes med '; '.
+    - Lager valgfri heading-<p class="table-as-list-head"> fra TH-rad (også separert med '; ').
+    - Idempotent: erstatter tidligere generert liste med class="table-as-list".
+    """
+    logger.info("2.5.1.18 - Tasks with tables better represented as lists")
+
+    tasks = [el for el in soup.find_all(True) if _is_task_container(el)]
+    if not tasks:
+        logger.info("2.5.1.18 - No task containers found.")
+    else:
+        converted = updated = skipped = 0
+
+        for task in tasks:
+            for tbl in task.find_all("table"):
+                # hopp hvis tabellen allerede er merket/konvertert
+                if tbl.get("data-replaced-as") == "table-as-list":
+                    continue
+
+                ok, headers, rows = _is_simple_layout_table(tbl, aggressive=aggressive)
+                if not ok:
+                    # valgfritt: bruk LLM i edge cases (anbefales av)
+                    if use_llm:
+                        # her kunne du sendt en liten prompt til LLM via din RabbitMQ-bro
+                        # og latt den returnere True/False for “layout-table”
+                        pass
+                    skipped += 1
+                    continue
+
+                existing = _existing_table_as_list(tbl)
+
+                # Bygg utdata
+                head_p = _make_head_p(soup, headers) if headers else None
+                ul = _make_ul_from_rows(soup, rows)
+
+                if existing is not None:
+                    # oppdater eksisterende representasjon
+                    # (håndter heading <p> foran lista)
+                    prev = existing.previous_sibling
+                    while isinstance(prev, NavigableString) and not prev.strip():
+                        prev = prev.previous_sibling
+                    if head_p:
+                        if isinstance(prev, Tag) and prev.name == "p" and "table-as-list-head" in (prev.get("class", []) or []):
+                            prev.replace_with(head_p)
+                        else:
+                            tbl.insert_before(head_p)
+                    existing.replace_with(ul)
+                    try:
+                        tbl.decompose()
+                    except Exception:
+                        pass
+                    updated += 1
+                else:
+                    # sett inn head + liste der tabellen sto, og fjern tabellen
+                    if head_p:
+                        tbl.insert_before(head_p)
+                    tbl.insert_before(ul)
+                    tbl["data-replaced-as"] = "table-as-list"
+                    try:
+                        tbl.decompose()
+                    except Exception:
+                        pass
+                    converted += 1
+
+        logger.info(
+            "2.5.1.18 - Done. converted=%d, updated=%d, skipped=%d",
+            converted, updated, skipped
+        )
 
     # 2.5.1.19 Tasks with text between subtasks
-    logger.info('2.5.1.19 Tasks with text between subtasks')
-    for task in soup(attrs={'epub:type':ASSESSMENTS}):
-        for subtask in task(attrs={'epub:type':ASSESSMENTS}):
-            if subtask.previous_sibling and not is_task(subtask.previous_sibling):
-                subtask.previous_sibling.wrap((div := soup.new_tag('div', attrs={'class':'extra-text'})))
-                subtask.insert(0, div)
+    """
+    2.5.1.19 Tasks with text between subtasks
+    - Flytt mellomtekst til *neste* <li>, i <div class="extra-text"> plassert først i li.
+    - Ikke rør første <li>.
+    - Behold liste udelte; pakk inn i <p>.
+    - Idempotent (hopper over li som allerede starter med .extra-text).
+    """
+    logger.info("2.5.1.19 - Tasks with text between subtasks")
+
+    tasks = [el for el in soup.find_all(True) if _is_task_container(el)]
+    if not tasks:
+        logger.info("2.5.1.19 - No task containers found.")
+    else:
+        moved_blocks = 0
+        touched_lists = 0
+
+        for task in tasks:
+            for lst in task.find_all(["ol","ul"]):
+                lis = lst.find_all("li", recursive=False)
+                if len(lis) < 2:
+                    continue
+
+                list_touched = False
+
+                # hopp første li; mellomtekst skal aldri legges i første li
+                for i in range(1, len(lis)):
+                    prev_li, cur_li = lis[i-1], lis[i]
+
+                    # idempotens: dersom cur_li *starter* med .extra-text, hopp
+                    first = _first_sig_child(cur_li)
+                    if isinstance(first, Tag) and first.name == "div" and "extra-text" in (first.get("class", []) or []):
+                        continue
+
+                    between = _collect_between_siblings(lst, prev_li, cur_li)
+                    if not between:
+                        continue
+
+                    # bygg <div class="extra-text"> med <p>-avsnitt
+                    paras = _wrap_into_paragraphs(soup, between)
+                    if not paras:
+                        continue
+
+                    extra = soup.new_tag("div")
+                    extra["class"] = ["extra-text"]
+                    for p in paras:
+                        extra.append(p)
+
+                    # sett inn *først* i cur_li
+                    cur_li.insert(0, extra)
+                    moved_blocks += 1
+                    list_touched = True
+
+                    # fjern mellomliggende noder (allerede extractet i _wrap_into_paragraphs)
+                    # sikre at det ikke ligger igjen blanke tekstnoder
+                    cur = prev_li.next_sibling
+                    while cur is not None and cur is not cur_li:
+                        nxt = cur.next_sibling
+                        try:
+                            if isinstance(cur, NavigableString) and not cur.strip():
+                                cur.extract()
+                        except Exception:
+                            pass
+                        cur = nxt
+
+                if list_touched:
+                    touched_lists += 1
+
+        logger.info("2.5.1.19 - Done. moved_blocks=%d, touched_lists=%d", moved_blocks, touched_lists)
 
     # 2.5.2 Tasks in mathematics books
     logger.info('2.5.2 - Tasks in mathematics books')
@@ -10153,6 +10524,11 @@ def main():
     parser.add_argument('--llm',
                         dest='llm',
                         help='Use local LLM (via RabbitMQ) for nuanced §2.1.2 decisions',
+                        action='store_true',
+                        default=False)
+    parser.add_argument('-a',
+                        '--aggressive',
+                        help='Convert tables (§2.5.1.18) more aggressively',
                         action='store_true',
                         default=False)
 
