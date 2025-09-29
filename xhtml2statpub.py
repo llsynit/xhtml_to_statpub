@@ -6840,6 +6840,153 @@ def _assign_scopes(thead: Tag | None, tbody: Tag | None):
             if first.name == "th" and not first.has_attr("scope"):
                 first["scope"] = "row"
 
+# --- Hjelpere for § 2.10.1 -----------------------------------------------------
+
+def _cell_span(cell: Tag) -> int:
+    try:
+        return max(1, int(cell.get("colspan", "1")))
+    except Exception:
+        return 1
+
+def _row_effective_cols(tr: Tag) -> int:
+    if getattr(tr, "name", "") != "tr":
+        return 0
+    return sum(_cell_span(c) for c in tr.find_all(["th","td"], recursive=False))
+
+def _is_collapsed(cell: Tag) -> bool:
+    st = (cell.get("style") or "").replace(" ", "").lower()
+    # enkel heuristikk for 'flag cell' som er visuelt skjult
+    return "visibility:collapse" in st or "display:none" in st
+
+def _ensure_caption_node(soup, table: Tag) -> Tag:
+    cap = table.find("caption", recursive=False)
+    if cap is None:
+        cap = soup.new_tag("caption")
+        # sett inn foreløpig på topp; vi vil uansett sikre rekkefølgen senere
+        table.insert(0, cap)
+    return cap
+
+def _move_caption_first(table: Tag):
+    # Flytt caption til å være første direkte barn
+    cap = table.find("caption", recursive=False)
+    if not cap:
+        return
+    if cap.previous_sibling is None:
+        return  # allerede først
+    cap.extract()
+    table.insert(0, cap)
+
+# --- Hjelpere for § 2.10.2 -----------------------------------------------------
+
+# Separatorer som ofte indikerer "flere elementer" stukket inn i én celle
+_CELL_SEP_RX = re.compile(r'\s*(?:,|;|/|\||•|·|–|-)\s+')
+
+def _has_math(node: Tag) -> bool:
+    # Ikke rør celler som inneholder MathML, AsciiMath, eller LaTeX-fragmenter
+    if node.find('math'):
+        return True
+    classes = ' '.join(node.get('class', [])).lower()
+    if 'asciimath' in classes:
+        return True
+    # very light LaTeX heuristic
+    txt = node.get_text('', strip=True)
+    if '$' in txt or r'\(' in txt or r'\[' in txt:
+        return True
+    return False
+
+def _split_by_br(node: Tag) -> list[str]:
+    """Del innhold i cellen ved <br>-grenser, bevar tekst (strippet)."""
+    items = []
+    buf = []
+    for child in list(node.children):
+        if isinstance(child, Tag) and child.name.lower() == 'br':
+            text = ''.join(c if isinstance(c, str) else c.get_text(' ', strip=True) for c in buf).strip()
+            if text:
+                items.append(text)
+            buf = []
+        else:
+            if isinstance(child, NavigableString):
+                buf.append(str(child))
+            elif isinstance(child, Tag):
+                buf.append(child.get_text(' ', strip=True))
+    # siste buffer
+    text = ''.join(c if isinstance(c, str) else c for c in buf).strip()
+    if text:
+        items.append(text)
+    return [i for i in (t.strip() for t in items) if i]
+
+def _split_by_separators(text: str) -> list[str]:
+    parts = _CELL_SEP_RX.split(text)
+    return [p.strip() for p in parts if p and p.strip()]
+
+def _looks_like_number_list(text: str) -> bool:
+    # flere tall / tallområder separert av sep/whitespace
+    nums = re.findall(r'(?:\b\d{1,3}(?:[.,]\d+)?\b)', text)
+    return len(nums) >= 4  # terskel: minst 4 tall → sannsynlig liste
+
+def _token_density(text: str) -> float:
+    tokens = re.findall(r'\w+', text, flags=re.UNICODE)
+    return len(tokens) / max(1, len(text))
+
+def _is_suspicious_cell(cell: Tag) -> bool:
+    if _has_math(cell):
+        return False
+    # Idempotens: hopp hvis vi allerede har normalisert til <ul class="list-unstyled">
+    if cell.find('ul', class_='list-unstyled'):
+        return False
+
+    # <br>-tunge celler → sannsynlig liste
+    if cell.find('br'):
+        parts = _split_by_br(cell)
+        if len(parts) >= 3:
+            return True
+
+    text = cell.get_text(' ', strip=True)
+    if not text or len(text) < 6:
+        return False
+
+    # Mange separatorer → sannsynlig liste
+    if len(re.findall(_CELL_SEP_RX, text)) >= 3:
+        return True
+
+    # Tall-liste?
+    if _looks_like_number_list(text):
+        return True
+
+    # Uvanlig høy tokendensitet kan indikere manglende cellegrenser (konservativ)
+    if _token_density(text) > 0.25 and len(text) > 120 and len(text.split()) > 25:
+        return True
+
+    return False
+
+def _normalize_cell_to_ul(cell: Tag, soup, logger) -> bool:
+    if cell.find('ul', class_='list-unstyled'):
+        return False
+    parts = []
+    if cell.find('br'):
+        parts = _split_by_br(cell)
+    if not parts:
+        text = cell.get_text(' ', strip=True)
+        parts = _split_by_separators(text)
+        if len(parts) < 3:
+            return False
+
+    # Terskler: unngå å lage gigantiske lister utilsiktet
+    if len(parts) > 50:
+        logger.debug("2.10.2 - Suspicious cell has >50 items; skipping auto-normalization.")
+        return False
+
+    # Tøm cellen og bygg ul
+    for n in list(cell.contents):
+        n.extract()
+    ul = soup.new_tag('ul', attrs={'class': 'list-unstyled'})
+    for p in parts:
+        li = soup.new_tag('li')
+        li.string = p
+        ul.append(li)
+    cell.append(ul)
+    return True
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -11666,47 +11813,171 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         )
 
     # 2.10.1 Table titles
-    logger.info('2.10.1 - Table titles')
-    for table in soup('table'):
+    """
+    2.10.1 Table titles
+    - Bruk <caption> rett etter <table>.
+    - Lag caption fra @title når mulig.
+    - Hvis første rad er "enkeltcelle"/kolonnedekkende → bruk innholdet som <caption>, fjern raden.
+    - Hvis 'flag cell' (f.eks. én synlig celle + én skjult i første rad) → flytt den synlige cellens innhold til <caption>.
+    - Idempotent: flere kjøringer endrer ikke resultatet.
+    """
+    logger.info("2.10.1 - Table titles")
 
-        # Convert title attribute to <caption>
-        if 'title' in table.attrs.keys() and not table.find('caption'):
-            table.insert(0, (caption := soup.new_tag('caption')))
-            caption.append(table['title'])
+    tables = soup.find_all("table")
+    if not tables:
+        logger.info("2.10.1 - No tables found.")
+    else:
+        used_title = moved_single_row = moved_flag_cell = moved_to_front = 0
 
-        # Move <caption> to the beginning of <table>
-        if (caption := table.find('caption')):
-            table.insert(0, caption)
+        for table in tables:
+            # 0) Sanity: hent første <tr> i DOM-rekkefølge (thead/tbody/tfoot spiller ingen rolle)
+            first_tr = table.find("tr")
 
-        # Convert initial one-cell row to caption
-        max_cells = 0
-        for tr in table('tr'):
-            if len(tr(['th', 'td'])) > max_cells:
-                max_cells = len(tr(['th', 'td']))
-        if max_cells > 1:
-            if ((first_row := table.find('tr'))(['th', 'td'])) == 1:
-                first_row.name = 'caption'
-                first_row.find(['th', 'td']).unwrap()
-                del first_row['colspan']
-                table.insert(0, first_row)
+            # 1) Har vi allerede en <caption>? Hvis ikke, prøv 'title'-attributt
+            existing_caption = table.find("caption", recursive=False)
+            if existing_caption is None:
+                tbl_title = table.get("title")
+                if tbl_title:
+                    cap = _ensure_caption_node(soup, table)
+                    if not cap.get_text("", strip=True):
+                        cap.clear()
+                        cap.append(NavigableString(tbl_title))
+                        used_title += 1
 
-        # "Flag cell"
-        tr = table.find('tr')
-        if len(tr(['th', 'td'])) == 2 and tr.find(attrs={'style':'visibility: collapse'}):
-            for cell in tr(['th', 'td']):
-                if 'style' not in cell.attrs.keys() or cell['style'] != 'visibility: collapse':
-                    cell.name = 'caption'
-                    table.insert(0, cell)
-                    tr.decompose()
+            # 2) Hvis fortsatt ingen caption, vurder første rad som “enkeltcelle/colspan”-tittel
+            caption = table.find("caption", recursive=False)
+            if first_tr is not None and (caption is None or not caption.get_text("", strip=True)):
+                cells = first_tr.find_all(["th","td"], recursive=False)
+                if cells:
+                    # Finn max kolonner blant de neste radene (heuristikk for "spenner over alle kolonner")
+                    sibling_rows = []
+                    cur = first_tr.find_next_sibling()
+                    while cur is not None and getattr(cur, "name", None) is not None:
+                        if cur.name == "tr":
+                            sibling_rows.append(cur)
+                            if len(sibling_rows) >= 5:
+                                break
+                        cur = cur.find_next_sibling()
+                    # hvis ingen søsken, test bare mot antall celler i første rad (>=1 gir håndtering)
+                    max_cols = 0
+                    for tr in sibling_rows:
+                        max_cols = max(max_cols, _row_effective_cols(tr))
+                    if max_cols == 0:
+                        # hvis vi ikke fant andre rader, men første rad har 1 celle — regn som tittelrad
+                        max_cols = max(max_cols, 2)  # tving “flere kolonner”-antakelse
+
+                    first_cols = _row_effective_cols(first_tr)
+                    # kandidat: nøyaktig én celle (evt. colspan) OG (effektive kolonner >= 1) og max_cols >= 2
+                    if first_cols >= 1 and (len(cells) == 1 or first_cols >= max_cols):
+                        # flytt innhold fra cellen til <caption> og fjern raden
+                        cap = _ensure_caption_node(soup, table)
+                        if not cap.get_text("", strip=True):
+                            cap.clear()
+                            # flytt innhold (bevar inline mark-up)
+                            for n in list(cells[0].contents):
+                                cap.append(n.extract())
+                            moved_single_row += 1
+                        # fjern hele raden
+                        first_tr.decompose()
+                        # oppdatér peker (ikke brukt videre)
+                        first_tr = table.find("tr")
+
+            # 3) “Flag cell” i øverste venstre hjørne (f.eks. to celler i første rad hvor én er skjult)
+            # Heuristikk: første rad har 1–2 celler og nøyaktig én 'synlig' celle med faktisk tekst.
+            caption = table.find("caption", recursive=False)
+            if first_tr is not None and (caption is None or not caption.get_text("", strip=True)):
+                cells = first_tr.find_all(["th","td"], recursive=False)
+                if 1 <= len(cells) <= 2:
+                    visible = [c for c in cells if not _is_collapsed(c)]
+                    if len(visible) == 1:
+                        txt = visible[0].get_text("", strip=True)
+                        if txt:
+                            cap = _ensure_caption_node(soup, table)
+                            if not cap.get_text("", strip=True):
+                                cap.clear()
+                                for n in list(visible[0].contents):
+                                    cap.append(n.extract())
+                                moved_flag_cell += 1
+                            # hvis raden nå er "tømt" eller bare inneholder kollapset celle → fjern den
+                            rest_cells = [c for c in first_tr.find_all(["th","td"], recursive=False)]
+                            if not rest_cells or all(_is_collapsed(c) or not c.get_text("", strip=True) for c in rest_cells):
+                                first_tr.decompose()
+
+            # 4) Sørg for at <caption> er første direkte barn av <table>
+            before = table.find("caption", recursive=False)
+            if before is not None and before.previous_sibling is not None:
+                _move_caption_first(table)
+                moved_to_front += 1
+
+        logger.info(
+            "2.10.1 - Done. from @title=%d, single-row→caption=%d, flag-cell→caption=%d, moved-to-front=%d",
+            used_title, moved_single_row, moved_flag_cell, moved_to_front
+        )
 
     # 2.10.2 Tables without clear boundaries between rows or columns
     # This does not apply in electronic books
+    """
+    2.10.2 Tables without clear boundaries
+    - Lint: finn celler som sannsynligvis inneholder flere elementer.
+    - Valgfri normalisering (--table-normalize-cell-lists):
+      konverter til <ul class="list-unstyled"> inne i cellen (ikke endre rader/kolonner).
+    - Hvis --llm: bruk modellen for å bekrefte normalisering ved tvilstilfeller.
+    """
+    logger.info("2.10.2 - Tables without clear boundaries between rows/columns")
+
+    llm = None
+    if getattr(args, "llm", False):
+        try:
+            llm = _ensure_llm_client(logger, args.llm)  # din eksisterende stub
+        except Exception:
+            llm = None
+
+    tables = soup.find_all("table")
+    if not tables:
+        logger.info("2.10.2 - No tables found.")
+    else:
+        flagged = normalized = 0
+
+        for table in tables:
+            for tr in table.find_all("tr"):
+                for cell in tr.find_all(["td", "th"], recursive=False):
+                    if not _is_suspicious_cell(cell):
+                        continue
+
+                    flagged += 1
+                    cell["data-table-lint"] = "suspicious-multiitem"
+
+                    do_normalize = bool(getattr(args, "table_normalize_cell_lists", False))
+                    # aldri auto-normaliser <th> (bevar overskrifter), men logg
+                    if cell.name == "th":
+                        do_normalize = False
+
+                    # Hvis LLM er aktiv: spør modellen ved tvil (kun hvis do_normalize er True)
+                    if do_normalize and llm and getattr(llm, "available", False):
+                        snippet = cell.get_text(" ", strip=True)[:400]
+                        resp = llm.classify_cell_multiitem(snippet=snippet)
+                        # forventet { "multiitem": bool, "confidence": float }
+                        if not resp or not resp.get("multiitem", False) or resp.get("confidence", 0) < 0.66:
+                            do_normalize = False
+
+                    if do_normalize:
+                        changed = _normalize_cell_to_ul(cell, soup, logger)
+                        if changed:
+                            normalized += 1
+
+        logger.info("2.10.2 - Done. Flagged cells=%d, Normalized=%d", flagged, normalized)
 
     # 2.10.3 Avoid use of <em> or <strong> in <th>
     logger.info('2.10.3 - Avoid use of <em> or <strong> in <th>')
-    for table in soup('table'):
-        for em in table(['em', 'strong']):
-            em.unwrap()
+
+    unwrapped = 0
+    for th in soup.find_all("th"):
+        # Finn alle em/strong (rekursivt) inne i th og fjern selve taggen, behold innholdet
+        for emph in list(th.find_all(["em", "strong"])):
+            emph.unwrap()
+            unwrapped += 1
+
+    logger.info(f'2.10.3 - Unwrapped {unwrapped} <em>/<strong> tag(s) inside <th>.')
 
     # 2.10.4 Avoid use of <p> within table cells
     logger.info('2.10.4 - Avoid use of <p> within table cells')
@@ -12069,6 +12340,9 @@ def main():
                         dest='cleanup_plays',
                         help='Cleanup false play markup (remove wrong class="play", bogus speaker/directions).',
                         action='store_true')
+    parser.add_argument('--table-normalize-cell-lists',
+        help='Normalize multi-item text inside table cells to <ul class="list-unstyled"> when safe.',
+        action='store_true')
 
     args = parser.parse_args()
     configure_logging(args.verbose)
