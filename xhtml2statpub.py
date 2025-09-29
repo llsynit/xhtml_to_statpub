@@ -12658,6 +12658,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         )
 
     # 2.10.8 Spreadsheets as tables
+    # DEPRECATED
     # This requirement should be covered by SMR 2.3.7.1
 
     # 2.11 Quotations, blockquotes, sources
