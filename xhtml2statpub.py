@@ -7567,6 +7567,202 @@ def _should_skip_target(el) -> bool:
     # Idempotens: ikke rør hvis vi allerede har flyttet kilde tidligere
     return el.get("data-moved-source") == "true"
 
+# --- Hjelpere for § 2.12.1 -----------------------------------------------------
+
+def _etokens(el: Tag) -> set:
+    t = (el.get("epub:type") or "").lower().replace(";", " ").replace(",", " ")
+    return set(t.split()) if t else set()
+
+def _class_tokens(el: Tag) -> set:
+    return set((el.get("class") or []))
+
+def _role_token(el: Tag) -> str:
+    return (el.get("role") or "").lower()
+
+'''
+def _nearest_section(node: Tag) -> Tag | None:
+    p = node
+    while p is not None:
+        if getattr(p, "name", None) == "section":
+            return p
+        p = p.parent
+    return soup.body or soup
+'''
+
+def _significant_children(parent: Tag):
+    out = []
+    for c in parent.contents:
+        if isinstance(c, NavigableString) and not (str(c) or "").strip():
+            continue
+        out.append(c)
+    return out
+
+def _is_footnote_like(el: Tag) -> bool:
+    if not getattr(el, "name", None):
+        return False
+    name = el.name.lower()
+    et = _etokens(el)
+    cls = _class_tokens(el)
+    role = _role_token(el)
+    if "footnote" in et or "endnote" in et:
+        return True
+    if role in {"doc-footnote", "doc-endnote"}:
+        return True
+    if name == "fn":
+        return True
+    if "footnote" in {c.lower() for c in cls}:
+        return True
+    # typiske containere for notelinjer
+    if name in {"aside","div","li"} and ("fn" in cls or "notes" in cls):
+        return True
+    return False
+
+def _belongs_to_footnote_list(el: Tag) -> Tag | None:
+    """
+    Hvis el er en del av en <ol>/<ul> med fotnoter, returner containeren (ellers None).
+    """
+    p = el.parent
+    if isinstance(p, Tag) and getattr(p, "name", None) in {"ol","ul"}:
+        pcl = {c.lower() for c in _class_tokens(p)}
+        prole = _role_token(p)
+        pet = _etokens(p)
+        if ("footnotes" in pcl or prole in {"doc-endnotes","doc-footnotes"} or
+            "footnotes" in pet or "endnotes" in pet):
+            return p
+    return None
+
+def _at_end_of_section(container: Tag, node: Tag) -> bool:
+    kids = _significant_children(container)
+    if not kids:
+        return False
+    # node må være siste signifikante barn
+    return kids and (kids[-1] is node)
+
+def _ensure_llm(logger, args):
+    try:
+        if getattr(args, "llm", False):
+            return _ensure_llm_client(logger, args.llm)
+    except NameError:
+        pass
+    return None
+
+def _llm_is_footnote(llm, context_html: str, candidate_text: str):
+    if not llm or not getattr(llm, "available", False):
+        return None
+    try:
+        resp = llm.classify_is_footnote(html_context=context_html[:2000],
+                                        candidate=candidate_text[:300])
+        return bool(resp.get("is_footnote", False))
+    except Exception as e:
+        logger.debug(f"2.12.1 - LLM classification failed: {e}")
+        return None
+
+def _node_text(tag: Tag) -> str:
+    return (tag.get_text(" ", strip=True) if hasattr(tag, "get_text") else "").strip()
+
+
+# --- Hjelpere for § 2.12.2 -----------------------------------------------------
+
+def _end_tok(val: str) -> set[str]:
+    return set((val or "").lower().replace(";", " ").replace(",", " ").split())
+
+def _end_etokens(el: Tag) -> set[str]:
+    return _end_tok(el.get("epub:type", ""))
+
+def _end_class_tokens(el: Tag) -> set[str]:
+    return set((el.get("class") or []))
+
+def _end_role(el: Tag) -> str:
+    return (el.get("role") or "").lower()
+
+def _end_is_significant(n) -> bool:
+    return not (isinstance(n, NavigableString) and not (str(n) or "").strip())
+
+def _end_significant_children(parent: Tag):
+    return [c for c in parent.contents if _end_is_significant(c)]
+
+def _end_top_level_section(soup):
+    # Finn toppnivå <section> i denne xhtml-fila (typisk første direkte barn av <body>)
+    if soup.body:
+        for ch in soup.body.children:
+            if isinstance(ch, Tag) and ch.name == "section":
+                return ch
+    # fallback: første <section> hvor som helst
+    sec = soup.find("section")
+    return sec or soup.body or soup
+
+def _end_is_endnotes_container(el: Tag) -> bool:
+    if not getattr(el, "name", None):
+        return False
+    et = _end_etokens(el)
+    cls = {c.lower() for c in _end_class_tokens(el)}
+    role = _end_role(el)
+    if "endnotes" in et or "chapter-notes" in et:
+        return True
+    if role in {"doc-endnotes"}:
+        return True
+    if "endnotes" in cls:
+        return True
+    # Vanlige varianter: <section class="notes"> med heading "Noter"/"Endnotes"
+    if el.name in {"section","div"} and ("notes" in cls or "note" in cls):
+        # Vi lar LLM/heuristikk ta en beslutning senere hvis nødvendig
+        return False
+    return False
+
+def _end_is_single_endnote(el: Tag) -> bool:
+    if not getattr(el, "name", None):
+        return False
+    name = el.name.lower()
+    et = _end_etokens(el)
+    cls = {c.lower() for c in _end_class_tokens(el)}
+    role = _end_role(el)
+    if name == "fn":
+        return True
+    if "endnote" in et:
+        return True
+    if role in {"doc-endnote"}:
+        return True
+    if "endnote" in cls:
+        return True
+    # <li id="en-1"> inne i en endnotes-liste – håndteres via containeren, ikke her
+    return False
+
+def _end_in_endnotes_container(el: Tag) -> Tag | None:
+    p = el.parent
+    if isinstance(p, Tag) and getattr(p, "name", None) in {"ol","ul","section","div"}:
+        if _end_is_endnotes_container(p) or p.get("data-relocated-endnotes") == "true":
+            return p
+        # <ol class="endnotes"> …
+        if p.name in {"ol","ul"}:
+            pcl = {c.lower() for c in _end_class_tokens(p)}
+            pet = _end_etokens(p)
+            prole = _end_role(p)
+            if ("endnotes" in pcl or "endnotes" in pet or prole in {"doc-endnotes"}):
+                return p
+    return None
+
+def _end_already_at_end(container: Tag, node: Tag) -> bool:
+    kids = _end_significant_children(container)
+    return bool(kids) and kids[-1] is node
+
+def _end_ensure_llm(logger, args):
+    try:
+        if getattr(args, "llm", False):
+            return _ensure_llm_client(logger, args.llm)
+    except Exception:
+        pass
+    return None
+
+def _end_llm_is_endnotes_container(llm, context_html: str) -> bool | None:
+    if not llm or not getattr(llm, "available", False):
+        return None
+    try:
+        resp = llm.classify_is_endnotes_container(html_context=context_html[:2000])
+        return bool(resp.get("is_endnotes_container", False))
+    except Exception as e:
+        logger.debug(f"2.12.2 - LLM classification failed: {e}")
+        return None
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -12875,54 +13071,233 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     # 2.12 Footnotes and endnotes
 
     # 2.12.1 Footnotes
-    logger.info('2.12.1 - Footnotes')
-    for fn in list(soup('fn')) + list(soup(attrs={'epub:type':'footnote'})):
-        for parent in fn.parents:
-            if parent.name == 'section':
-                parent.insert(len(parent.contents), fn)
-                while fn.previous_sibling.name in ['glossary', 'dl']:
-                    fn.previous_sibling.insert_before(fn)
-                break
+    llm = _ensure_llm(logger, args)
+    moved_single = moved_lists = 0
+    skipped = 0
+
+    # Samle kandidater i dokumentrekkefølge (før vi muterer)
+    candidates: list[Tag] = []
+    for el in soup.find_all(True):
+        if _is_footnote_like(el):
+            candidates.append(el)
+
+    # Idempotens: ikke ta de som allerede er merket
+    candidates = [el for el in candidates if el.get("data-relocated-footnote") != "true"]
+
+    # Flytt liste-containere først (for å bevare nummerering), deretter enkelt-noter
+    list_candidates, single_candidates = [], []
+    for el in candidates:
+        cont = _belongs_to_footnote_list(el)
+        if cont is not None:
+            # flytt containeren (ikke den enkelte li)
+            list_candidates.append(cont)
+        else:
+            single_candidates.append(el)
+
+    # Dedupliser containere (kan forekomme samme flere ganger via ulike <li>)
+    seen = set()
+    uniq_list_containers = []
+    for c in list_candidates:
+        key = id(c)
+        if key not in seen:
+            uniq_list_containers.append(c)
+            seen.add(key)
+
+    # 1) Flytt fotnote-lister (ol/ul) til slutten av seksjonen
+    for cont in uniq_list_containers:
+        # Finn relevant seksjon
+        sec = _nearest_section(cont, soup)
+        if not sec:
+            skipped += 1
+            continue
+        # Sjekk om containeren allerede ligger sist
+        if cont.parent is sec and _at_end_of_section(sec, cont):
+            cont["data-relocated-footnote"] = "true"
+            continue
+
+        # LLM (valgfritt) dersom containeren ikke tydelig er fotnoter
+        if not (_class_tokens(cont) & {"footnotes"}) and not (_etokens(cont) & {"footnotes","endnotes"}) and _role_token(cont) not in {"doc-footnotes","doc-endnotes"}:
+            if llm:
+                decision = _llm_is_footnote(llm, str(sec), _node_text(cont))
+                if decision is False:
+                    skipped += 1
+                    continue
+
+        # Flytt
+        cont.extract()
+        sec.append(cont)
+        cont["data-relocated-footnote"] = "true"
+        moved_lists += 1
+
+    # 2) Flytt enkeltstående fotnoter til slutten av seksjonen (men etter evt. fotnote-liste)
+    for fn in single_candidates:
+        # Hvis noden rakk å bli fjernet (f.eks. via listeflytt), hopp
+        if not getattr(fn, "parent", None):
+            continue
+
+        sec = _nearest_section(fn, soup)
+        if not sec:
+            skipped += 1
+            continue
+
+        # Finn om det allerede finnes en fotnote-liste på slutten – i så fall legg etter lista
+        kids = _significant_children(sec)
+        insert_after = None
+        for k in reversed(kids):
+            if getattr(k, "name", None) in {"ol","ul"}:
+                pcl = {c.lower() for c in _class_tokens(k)}
+                if "footnotes" in pcl or _role_token(k) in {"doc-endnotes","doc-footnotes"} or (_etokens(k) & {"footnotes","endnotes"}):
+                    insert_after = k
+                    break
+
+        # Idempotens: hvis fn allerede ligger sist og/eller etter fotnotelista, hopp
+        if fn.parent is sec and _at_end_of_section(sec, fn):
+            fn["data-relocated-footnote"] = "true"
+            continue
+
+        # Dersom vi skal legge etter en eksisterende liste, og fn er en <li> fra et annet sted:
+        if insert_after is not None and fn.name == "li":
+            # Legg den inn i samme liste om det gir mening
+            insert_after.append(fn.extract())
+            fn["data-relocated-footnote"] = "true"
+            moved_single += 1
+            continue
+
+        # LLM (valgfritt) om heuristikk er tvilsom
+        if not _is_footnote_like(fn):
+            if llm:
+                decision = _llm_is_footnote(llm, str(sec), _node_text(fn))
+                if decision is False:
+                    skipped += 1
+                    continue
+
+        # Flytt fn til slutten (eller etter lista)
+        fn.extract()
+        if insert_after is not None and insert_after.parent is sec:
+            insert_after.insert_after(fn)
+        else:
+            sec.append(fn)
+        fn["data-relocated-footnote"] = "true"
+        moved_single += 1
+
+    logger.info("2.12.1 - Done. Moved lists=%d, moved singles=%d, skipped=%d",
+                moved_lists, moved_single, skipped)
 
     # 2.12.2 Endnotes and chapter notes
-    logger.info('2.12.2 - Endnotes and chapter notes')
-    endnotes = soup(attrs={'epub:type':'endnotes'})
-    if len(endnotes) == 1:
-        for parent in reversed(list(endnotes[0].parents)):
-            if parent.name == 'section':
-                parent.insert(len(parent.contents), endnotes[0])
-                break
+    containers: list[Tag] = []
+    singles: list[Tag] = []
+    for el in soup.find_all(True):
+        if _end_is_endnotes_container(el):
+            containers.append(el)
+        elif _end_is_single_endnote(el):
+            singles.append(el)
+
+    # Hvis ingen eksplisitte containere, se etter sannsynlige (heading 'Noter', 'Endnotes' etc.)
+    llm = _end_ensure_llm(logger, args)
+    if not containers:
+        # Heuristisk: <section>/<div> med heading-tekst "Noter"/"Endnotes"/"Kapittelnoter"
+        for cand in soup.find_all(["section","div"]):
+            if getattr(cand, "name", None) and cand.get("data-relocated-endnotes") != "true":
+                # Sjekk etter heading
+                h = cand.find(re.compile(r"^h[1-6]$", re.I))
+                title = (h.get_text(" ", strip=True).lower() if h else "").strip()
+                if title in {"noter", "sluttnoter", "kapittelnoter", "endnotes", "chapter notes", "chapter-notes"}:
+                    containers.append(cand)
+                    continue
+                # Evt. LLM
+                if args.llm:
+                    decide = _end_llm_is_endnotes_container(llm, str(cand))
+                    if decide:
+                        containers.append(cand)
+
+    # --- Finn toppnivå-<section> og (gjen)bruk/lag én endnotes-container ---------
+    top = _end_top_level_section(soup)
+    main = None
+
+    # Gjenbruk første eksisterende container som 'main'
+    for c in containers:
+        main = c
+        break
+
+    if main is None:
+        # Opprett ny tom container
+        main = soup.new_tag("section")
+        # bruk epub:type=endnotes
+        main["epub:type"] = "endnotes"
+        # plasser ved slutten av toppnivå-seksjonen (foretrukket), ellers body
+        target_parent = top if isinstance(top, Tag) else (soup.body or soup)
+        target_parent.append(main)
     else:
-        for endnote in endnotes:
-            for parent in endnote.parents:
-                if (parent.name == 'section' and
-                    'epub:type' in parent.attrs.keys() and
-                    parent['epub:type'] == 'bodymatter chapter'):
-                    parent.insert(len(parent.contents), endnote)
+        # sørg for at den har korrekt type
+        et = _end_etokens(main)
+        if "endnotes" not in et:
+            # bevar ev. eksisterende epub:type og legg til 'endnotes'
+            et2 = " ".join(sorted(et | {"endnotes"})) if et else "endnotes"
+            main["epub:type"] = et2
 
-    '''
-    all_endnotes = []
+    # Merk idempotens
+    main["data-relocated-endnotes"] = "true"
 
-    for endnotes in soup(attrs={'epub:type':'endnotes'}):
-        all_endnotes.append(endnotes)
-        if not endnotes.name == 'section':
-            endnotes.wrap((endnotes :=soup.new_tag('section', attrs={'epub:type':'endnotes'})))
-        for parent in reversed(list(endnotes.parents)):
-            if parent.name == 'section':
-                parent.insert(len(parent.contents), endnotes)
-                endnotes['relocated']       = True
-                endnotes['relocated_from']  = original_page(endnotes, soup, logger)
+    # --- Flett innhold fra øvrige containere inn i 'main' i dokumentrekkefølge ----
+    merged = 0
+    for c in containers[1:]:
+        if c is main:
+            continue
+        # flytt alle signifikante barne-noder inn i main
+        for ch in list(c.contents):
+            if _end_is_significant(ch):
+                main.append(ch.extract())
+        # fjern tom wrapper
+        try:
+            c.decompose()
+        except Exception:
+            pass
+        merged += 1
 
-    if not all_endnotes:
-        last_soup       = nordic.content[-1]
-        upper_section   = last_soup.find('section')
-        endnotes        = last_soup.new_tag('section', attrs={'epub:type':'endnotes'})
-        if not upper_section == endnotes:
-            upper_section.insert(len(section.contents), endnotes)
-        for soup in nordic.content:
-            for endnote in soup(attrs={'epub:type':'endnote'}):
-                endnotes.insert(len(endnotes.contents), endnote)
-    '''
+    # --- Flytt enkelt-noter inn i main (hopp over de som allerede ligger i en endnotes-container)
+    moved_singles = 0
+    for n in singles:
+        if not getattr(n, "parent", None):
+            continue
+        if _end_in_endnotes_container(n):
+            # Ligger allerede i en container (kanskje ikke i 'main', men ble evt. koplet inn over)
+            continue
+        # Flytt inn i 'main'
+        try:
+            n.extract()
+            main.append(n)
+            moved_singles += 1
+        except Exception:
+            pass
+
+    # --- Sørg for at main ligger helt sist i toppnivå-<section> -------------------
+    # (…«before the closing of the top-level <section> element».)
+    if isinstance(top, Tag) and main.parent is not top:
+        # flytt inn i top hvis mulig
+        try:
+            main.extract()
+            top.append(main)
+        except Exception:
+            pass
+
+    # Hvis main allerede er siste signifikante barn, gjør ingenting; ellers flytt til slutt
+    if isinstance(top, Tag):
+        if not _end_already_at_end(top, main):
+            try:
+                main.extract()
+                top.append(main)
+            except Exception:
+                pass
+    else:
+        # fallback body
+        if soup.body and main.parent is not soup.body:
+            try:
+                main.extract()
+                soup.body.append(main)
+            except Exception:
+                pass
+
+    logger.info("2.12.2 - Done. Merged containers=%d, moved singles=%d", merged, moved_singles)
 
     # 2.13 Grammar
 
