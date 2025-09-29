@@ -721,6 +721,16 @@ def figure_to_table(docs, soup, figure):
 
 # --- Hjelpere for §2.1.2 ------------------------------------------------------
 
+# For 2.5.1.12
+def _looks_like_task_block(el):
+    # enkel språk-agnostisk sjekk
+    txt = (el.get_text(" ", strip=True) or "").lower()
+    return any(token in txt for token in ("oppgave", "oppgåve", "task", "exercise"))
+
+# For 2.5.1.12
+def _has_taskish_descendant(el):
+    return el.find(lambda t: getattr(t, "name", None) and _is_task_container(t)) is not None
+
 def _find_next_pagebreak(el):
     return el.find_next(lambda x: getattr(x, "name", None) and _is_pagebreak(x))
 
@@ -5051,9 +5061,30 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
                 name = child.name.lower()
 
+                if args.llm and llm and not (_is_task_container(child) or _has_taskish_descendant(child)):
+                    if _looks_like_task_block(child):
+                        # spør LLM om figuren er "integral" for oppgaven
+                        resp = llm.classify_task_bound_figure(
+                            html_snippet=str(child)[:2000],
+                            context_before=_get_text_snippet(child.find_previous("p") or child),
+                            context_after=_get_text_snippet(child.find_next("p") or child),
+                        )
+                        if resp.get("task_bound", False):
+                            # ikke flytt
+                            pass
+                        else:
+                            images.append(child); seen.add(key)
+                    else:
+                        images.append(child); seen.add(key)
+
                 # 1) FIGURES/IMAGES
                 if name in ("figure",):
-                    images.append(child); seen.add(key); continue
+                    # hopp over hvis figuren hører til oppgave
+                    if _in_task_or_key_ancestor(child) or _is_task_container(child):
+                        pass  # ikke flytt
+                    else:
+                        images.append(child); seen.add(key)
+                    continue
                 if name not in ("figure",) and child.find("img") and name not in ("header", "footer", "nav"):
                     # Enkel heuristikk: enslige bilder blokkvis
                     # Unngå å ta med headings etc. som bare *inneholder* img-ikoner
