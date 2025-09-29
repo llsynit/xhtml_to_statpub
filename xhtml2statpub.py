@@ -5249,6 +5249,101 @@ def _mark_list_type_none(ol: Tag):
         if "value" in li.attrs:
             del li.attrs["value"]
 
+# --- Hjelpere for 2.5.1.16 ----------------------------------------------------
+
+# --- konfig/heuristikk --------------------------------------------------------
+
+_TASKISH_TOKENS = {
+    "assessment","assessments",
+    "exercise","exercises",
+    "practice","task","tasks",
+    "question","questions",
+}
+
+_ANSWERISH_TOKENS = {"answer","answers","key","fasit"}
+_EXAMPLEISH_TOKENS = {"example","sample","model"}
+
+_BLOCK_TAGS = {
+    "address","article","aside","blockquote","caption","center","div","dl","dt","dd","figure","figcaption",
+    "footer","form","h1","h2","h3","h4","h5","h6","header","hr","li","main","nav","ol","p","pre","section",
+    "table","tbody","thead","tfoot","tr","td","th","ul","video","audio","canvas","math"
+}
+
+# nb/no/nn/en prefikser for eksempelsvar
+_EXAMPLE_PREFIX_RX = re.compile(
+    r"^\s*(?:"
+    r"svar(?:et)?|fasit|eksempel(?:svar)?|døme(?:\s*på\s*svar)?|"
+    r"answer|example\s+answer|sample\s+answer|model\s+answer|example"
+    r")\s*[:\-–—]?\s*",
+    re.IGNORECASE
+)
+
+def _epub_types(el: Tag) -> set[str]:
+    t = (el.get("epub:type") or "").lower()
+    return set(t.replace(";", " ").replace(",", " ").split()) if t else set()
+
+def _is_task_container(el: Tag) -> bool:
+    if not getattr(el, "name", None): return False
+    cls = set(el.get("class", []) or [])
+    if "task" in cls: return True
+    et = _epub_types(el)
+    return bool(et & _TASKISH_TOKENS)
+
+def _is_answer_section(el: Tag) -> bool:
+    # Unngå å røre fasit/svar-seksjoner
+    cls = set(el.get("class", []) or [])
+    if "key" in cls: return True
+    et = _epub_types(el)
+    return bool(et & _ANSWERISH_TOKENS)
+
+def _text(n) -> str:
+    if n is None: return ""
+    if isinstance(n, NavigableString): return str(n)
+    return n.get_text(" ", strip=True) or ""
+
+def _is_inline_only(tag: Tag) -> bool:
+    for d in tag.descendants:
+        if isinstance(d, Tag) and d.name in _BLOCK_TAGS and d is not tag:
+            return False
+    return True
+
+def _looks_like_example_node(node: Tag) -> bool:
+    # epub:type-hint
+    et = _epub_types(node)
+    if et & (_ANSWERISH_TOKENS | _EXAMPLEISH_TOKENS):
+        return True
+    # class-hint
+    cls = " ".join(node.get("class", [])).lower()
+    if any(tok in cls for tok in ("answer","fasit","eksempel","example","sample","model")):
+        return True
+    # tekst-prefiks
+    txt = _text(node)
+    if _EXAMPLE_PREFIX_RX.match(txt):
+        return True
+    return False
+
+def _clean_example_text(txt: str) -> str:
+    # Fjern språk-prefiks ("Svar:", "Example answer:" osv.)
+    cleaned = _EXAMPLE_PREFIX_RX.sub("", txt or "").strip()
+    # komprimer whitespace
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    # fjern avsluttende punktum om det seiler rett før parentesen (smakssak)
+    return cleaned
+
+def _li_has_same_parenthetical(li: Tag, example_text: str) -> bool:
+    if not example_text:
+        return False
+    # Ganske enkel sjekk: finnes "(example_text)" allerede i li-tekst?
+    li_txt = li.get_text(" ", strip=True)
+    return f"({example_text})" in li_txt
+
+def _insertion_anchor_inside_li(li: Tag):
+    # Sett inn før første nested liste hvis den finnes, ellers på slutten
+    for child in li.find_all(recursive=False):
+        if getattr(child, "name", "") in {"ol","ul"}:
+            return child
+    return None
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -9211,11 +9306,108 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         logger.info("2.5.1.15 - Done. converted=%d, normalized=%d, skipped=%d", converted, normalized, skipped)
 
     # 2.5.1.16 Tasks where examples of answers are given
-    logger.info('2.5.1.16 Tasks where examples of answers are given')
-    for list_element in soup('ol', 'ul'):
-        if is_task(list_element) or is_part_of_task(list_element):
-            pass
-            # TODO: check format
+    """
+    2.5.1.16 Tasks where examples of answers are given
+    - Finn korte 'eksempelsvar' rett under et spørsmål i samme <li>, flytt inn i parentes på slutten av li.
+    - Idempotent: markerer li med data-example-collapsed="true" og sjekker for eksisterende parentes.
+    """
+    logger.info("2.5.1.16 - Tasks where examples of answers are given")
+
+    tasks = [el for el in soup.find_all(True) if _is_task_container(el) and not _is_answer_section(el)]
+    if not tasks:
+        logger.info("2.5.1.16 - No task containers (excluding answers) found.")
+    else:
+        collapsed_count = 0
+        skipped_count = 0
+
+        for task in tasks:
+            for lst in task.find_all(["ol","ul"]):
+                # se på top-level li
+                for li in lst.find_all("li", recursive=False):
+
+                    if li.get("data-example-collapsed") == "true":
+                        continue  # idempotens
+
+                    # Kandidater for eksempelsvar er typisk direkte barn av li:
+                    # <p>/<span>/<em>/<strong>/<div> ... OG små underlister med *1* li
+                    candidates: list[Tag] = []
+                    for child in li.find_all(recursive=False):
+                        nm = getattr(child, "name", "") or ""
+                        if nm in {"ol","ul"}:
+                            # underliste med nøyaktig ett punkt → kandidat hvis inline-only
+                            sublis = child.find_all("li", recursive=False)
+                            if len(sublis) == 1 and _is_inline_only(sublis[0]):
+                                if _looks_like_example_node(sublis[0]) or _EXAMPLE_PREFIX_RX.match(_text(sublis[0])):
+                                    candidates.append(sublis[0])
+                            continue
+                        if nm in {"p","span","em","strong","i","b","div"} and _is_inline_only(child):
+                            if _looks_like_example_node(child) or _EXAMPLE_PREFIX_RX.match(_text(child)):
+                                candidates.append(child)
+
+                    # hvis ingen/for mange kandidater → hopp
+                    if not candidates:
+                        skipped_count += 1
+                        continue
+                    if len(candidates) > 2 and not use_llm:
+                        # vær konservativ uten LLM
+                        skipped_count += 1
+                        continue
+
+                    # velg én kandidat (første i dokumentrekkefølge; evt. LLM kunne velge bedre)
+                    cand = candidates[0]
+
+                    # hent tekst (for <li> kandidat fra underliste, bruk innholdet av den li-en)
+                    ctext = _text(cand)
+                    ctext = _clean_example_text(ctext)
+
+                    # korte, inline-eksempler: sett grense (f.eks. 160 char) for å hindre store blokker
+                    if not ctext or len(ctext) > 160:
+                        skipped_count += 1
+                        continue
+
+                    # sjekk idempotens (samme parentes finnes)
+                    if _li_has_same_parenthetical(li, ctext):
+                        # rydde bort kandidatnoden om den er en duplikat-hint
+                        try:
+                            # om cand er en sub-li inni underliste: fjern hele underlisten hvis den ble tom
+                            parent_list = cand.parent if cand.name == "li" else None
+                            cand.decompose()
+                            if parent_list and isinstance(parent_list, Tag) and parent_list.name in {"ol","ul"}:
+                                if not parent_list.find_all("li", recursive=False):
+                                    parent_list.decompose()
+                        except Exception:
+                            pass
+                        li["data-example-collapsed"] = "true"
+                        collapsed_count += 1
+                        continue
+
+                    # finn innsettingspunkt (før første nested liste) eller på slutten
+                    anchor = _insertion_anchor_inside_li(li)
+                    insert_text = NavigableString(f" ({ctext})")
+
+                    if anchor is not None:
+                        anchor.insert_before(insert_text)
+                    else:
+                        li.append(insert_text)
+
+                    # fjern kandidatnoden fra strukturen
+                    try:
+                        if cand.name == "li":
+                            # underliste med én li → fjern hele listen
+                            parent_list = cand.parent
+                            cand.decompose()
+                            if parent_list and isinstance(parent_list, Tag) and parent_list.name in {"ol","ul"}:
+                                if not parent_list.find_all("li", recursive=False):
+                                    parent_list.decompose()
+                        else:
+                            cand.decompose()
+                    except Exception:
+                        pass
+
+                    li["data-example-collapsed"] = "true"
+                    collapsed_count += 1
+
+        logger.info("2.5.1.16 - Done. collapsed=%d, skipped=%d", collapsed_count, skipped_count)
 
     # 2.5.1.17 Tasks with ticking boxes
     # TODO: Check formatting
