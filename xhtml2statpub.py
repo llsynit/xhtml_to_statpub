@@ -7423,6 +7423,150 @@ def _make_ul_from_table(table, soup, use_headers=True):
 
     return ul if ul.find("li") else None
 
+# --- Hjelpere for § 2.10.7 -----------------------------------------------------
+
+_SOURCE_PREFIX_RX = re.compile(
+    r"""^\s*(
+        (kilde|kjelde|source|foto|fotograf|illustrasjon|illu\.?|bilde|copyright|©)
+        \s*[:\-–]?
+    )\s*""",
+    re.IGNORECASE | re.VERBOSE
+)
+
+def _is_whitespace_node(n):
+    from bs4 import NavigableString
+    return isinstance(n, NavigableString) and not (str(n) or "").strip()
+
+def _next_meaningful_sibling(node):
+    sib = node.next_sibling
+    while sib is not None and _is_whitespace_node(sib):
+        sib = sib.next_sibling
+    return sib
+
+def _node_text(tag):
+    return (tag.get_text(" ", strip=True) if hasattr(tag, "get_text") else "").strip()
+
+def _looks_like_source_text(text: str) -> bool:
+    if not text:
+        return False
+    if _SOURCE_PREFIX_RX.search(text):
+        return True
+    # Enkle signaturer: starter med © eller "Copyright"
+    if text.startswith("©") or text.lower().startswith("copyright"):
+        return True
+    # Svært korte "— Forfatternavn" linjer etter blockquote tolkes ofte som kilde
+    if text.startswith("—") and len(text) <= 120:
+        return True
+    return False
+
+def _is_source_like_tag(tag) -> bool:
+    if not getattr(tag, "name", None):
+        return False
+    if tag.name in {"cite"}:
+        return True
+    if tag.name in {"p", "small", "span", "div"}:
+        return _looks_like_source_text(_node_text(tag))
+    return False
+
+def _ensure_llm(logger, args):
+    try:
+        if getattr(args, "llm", False):
+            return _ensure_llm_client(logger, args.llm)
+    except NameError:
+        pass
+    return None
+
+def _llm_says_source(llm, container_html: str, candidate_text: str) -> bool | None:
+    if not llm or not getattr(llm, "available", False):
+        return None
+    try:
+        resp = llm.classify_is_source_line(
+            html_context=container_html[:2000],
+            candidate=candidate_text[:300]
+        )
+        return bool(resp.get("is_source", False))
+    except Exception as e:
+        logger.debug(f"2.11 - LLM classification failed: {e}")
+        return None
+
+def _append_cite_to_blockquote(bq, soup, content_tag):
+    """Legg til <cite> inni blockquote av enten eksisterende <cite> eller plain tekst."""
+    if content_tag.name == "cite":
+        cite = content_tag
+        cite.extract()
+        bq.append(cite)
+    else:
+        text = _node_text(content_tag)
+        cite = soup.new_tag("cite")
+        cite.string = text
+        bq.append(cite)
+    bq["data-moved-source"] = "true"
+    content_tag.decompose()
+
+def _ensure_figcaption(fig, soup):
+    cap = fig.find("figcaption")
+    if cap is None:
+        cap = soup.new_tag("figcaption")
+        fig.append(cap)
+    return cap
+
+def _append_cite_to_figcaption(fig, soup, content_tag):
+    cap = _ensure_figcaption(fig, soup)
+    if content_tag.name == "cite":
+        cite = content_tag
+        cite["class"] = list(set(cite.get("class", [])) | {"source"})
+        cite.extract()
+        cap.append(cite)
+    else:
+        text = _node_text(content_tag)
+        cite = soup.new_tag("cite")
+        cite["class"] = ["source"]
+        cite.string = text
+        cap.append(cite)
+    fig["data-moved-source"] = "true"
+    content_tag.decompose()
+
+def _ensure_caption(table, soup):
+    cap = table.find("caption")
+    if cap is None:
+        cap = soup.new_tag("caption")
+        table.insert(0, cap)
+    else:
+        # Sørg for at caption ligger først
+        if cap is not table.contents[0]:
+            cap.extract()
+            table.insert(0, cap)
+    return cap
+
+def _append_source_to_caption(table, soup, content_tag):
+    cap = _ensure_caption(table, soup)
+    existing = _node_text(cap)
+    if content_tag.name == "cite":
+        src_text = _node_text(content_tag)
+    else:
+        src_text = _node_text(content_tag)
+
+    if not src_text:
+        # Ingen nytte → bare fjern kandidaten
+        content_tag.decompose()
+        return
+
+    # Sett inn med ' – ' hvis vi allerede har caption-tekst
+    if existing:
+        cap.append(" – ")
+
+    cite = soup.new_tag("cite")
+    cite["class"] = ["source"]
+    cite.string = src_text
+    cap.append(cite)
+
+    table["data-moved-source"] = "true"
+    content_tag.decompose()
+
+def _should_skip_target(el) -> bool:
+    # Idempotens: ikke rør hvis vi allerede har flyttet kilde tidligere
+    return el.get("data-moved-source") == "true"
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -12662,10 +12806,71 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     # This requirement should be covered by SMR 2.3.7.1
 
     # 2.11 Quotations, blockquotes, sources
-    logger.info('2.11 - Quotations, blockquotes, sources')
-    for blockquote in soup('blockquote'):
-        if not blockquote.parent.find('cite'):
-            pass # TODO: Deal with this interactively
+    llm = _ensure_llm(logger, args)
+    moved_bq = moved_fig = moved_tbl = 0
+    skipped = 0
+
+    # 1) Blockquotes: flytt kilde inn i blockquote
+    for bq in soup.find_all("blockquote"):
+        if _should_skip_target(bq) or bq.find("cite"):
+            continue
+        sib = _next_meaningful_sibling(bq)
+        if not sib or not getattr(sib, "name", None):
+            continue
+
+        move_it = _is_source_like_tag(sib)
+        if not move_it and llm:
+            move_it = bool(_llm_says_source(llm, str(bq), _node_text(sib)))
+
+        if move_it:
+            _append_cite_to_blockquote(bq, soup, sib)
+            moved_bq += 1
+
+    # 2) Figures: flytt kilde inn i figcaption
+    for fig in soup.find_all("figure"):
+        if _should_skip_target(fig):
+            continue
+        # Hvis figcaption allerede har <cite>, anta OK
+        fc = fig.find("figcaption")
+        if fc and fc.find("cite"):
+            continue
+
+        sib = _next_meaningful_sibling(fig)
+        if not sib or not getattr(sib, "name", None):
+            continue
+
+        move_it = _is_source_like_tag(sib)
+        if not move_it and llm:
+            move_it = bool(_llm_says_source(llm, str(fig), _node_text(sib)))
+
+        if move_it:
+            _append_cite_to_figcaption(fig, soup, sib)
+            moved_fig += 1
+
+    # 3) Tabeller: flytt kilde inn i caption
+    for tbl in soup.find_all("table"):
+        if _should_skip_target(tbl):
+            continue
+        cap = tbl.find("caption")
+        if cap and cap.find("cite"):
+            continue
+
+        sib = _next_meaningful_sibling(tbl)
+        if not sib or not getattr(sib, "name", None):
+            continue
+
+        move_it = _is_source_like_tag(sib)
+        if not move_it and llm:
+            move_it = bool(_llm_says_source(llm, str(tbl), _node_text(sib)))
+
+        if move_it:
+            _append_source_to_caption(tbl, soup, sib)
+            moved_tbl += 1
+
+    logger.info(
+        "2.11 - Done. Moved: blockquotes=%d, figures=%d, tables=%d",
+        moved_bq, moved_fig, moved_tbl
+    )
 
     # 2.12 Footnotes and endnotes
 
