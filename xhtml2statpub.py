@@ -5347,14 +5347,12 @@ def _insertion_anchor_inside_li(li: Tag):
 # --- Hjelpere for 2.5.1.17 ----------------------------------------------------
 
 _TASKISH_TOKENS = {
-    "assessment","assessments",
-    "exercise","exercises",
-    "practice","task","tasks",
-    "question","questions",
-    "answer","answers","key","fasit"
+    "assessment","assessments","exercise","exercises",
+    "practice","task","tasks","question","questions","key","fasit"
 }
 
 _CHECK_GLYPHS = set("☐☑☒✓✔✗✘")
+_LEADING_NUM_RX = re.compile(r"^\s*\d+[\.\):]?\s*")
 
 def _epub_types(el: Tag) -> set[str]:
     t = (el.get("epub:type") or "").lower()
@@ -5366,28 +5364,25 @@ def _is_task_container(el: Tag) -> bool:
     if "task" in cls or "key" in cls: return True
     return bool(_epub_types(el) & _TASKISH_TOKENS)
 
+def _doc_lang(soup) -> str:
+    html = getattr(soup, "html", None)
+    if not html: return "no"
+    return (html.get("xml:lang") or html.get("lang") or "no").lower()
+
 def _text(n) -> str:
     if n is None: return ""
     if isinstance(n, NavigableString): return str(n)
     return n.get_text(" ", strip=True) or ""
 
-def _get_rows(tbl: Tag):
-    return tbl.find_all("tr", recursive=False)
-
-def _get_cells(tr: Tag):
-    return tr.find_all(["td","th"], recursive=False)
+def _rows(tbl: Tag): return tbl.find_all("tr", recursive=False)
+def _cells(tr: Tag): return tr.find_all(["td","th"], recursive=False)
 
 def _is_checkboxy_cell(cell: Tag) -> bool:
-    # input[type=checkbox], svg/tegn, "x"/"X" alene, eller img med alt som indikerer checkbox
     if cell.find(lambda t: getattr(t, "name", "") == "input" and (t.get("type") or "").lower() == "checkbox"):
         return True
-    if cell.find("svg"):
-        return True
+    if cell.find("svg"): return True
     txt = _text(cell)
-    if txt and txt.strip() in {"x","X"}:
-        return True
-    if txt and any(ch in _CHECK_GLYPHS for ch in txt):
-        return True
+    if txt and (txt.strip() in {"x","X"} or any(ch in _CHECK_GLYPHS for ch in txt)): return True
     img = cell.find("img")
     if img:
         alt = (img.get("alt") or "").lower()
@@ -5396,124 +5391,145 @@ def _is_checkboxy_cell(cell: Tag) -> bool:
     return False
 
 def _detect_ticking_table(table: Tag):
-    """
-    Returner (ok, headings:list[str], statements:list[str]).
-    - headings: ord fra 'avkryssings' kolonneoverskrifter (unntatt første tekstkolonne)
-    - statements: tekst i første kolonne (én per rad)
-    """
-    rows = _get_rows(table)
-    if len(rows) < 2:
-        return False, [], []
+    rows = _rows(table)
+    if len(rows) < 2: return False, [], [], None
 
-    # Finn header-rad: prioriter en rad med th-celler øverst
-    header = None
-    if rows and any(c.name == "th" for c in _get_cells(rows[0])):
-        header = rows[0]
-        body_rows = rows[1:]
-    else:
-        # evt. se etter rad med flest th
-        th_candidates = [r for r in rows if any(c.name == "th" for c in _get_cells(r))]
-        if th_candidates:
-            header = th_candidates[0]
-            idx = rows.index(header)
-            body_rows = rows[:idx] + rows[idx+1:]
-        else:
-            # ingen tydelig header → prøv å infere kolonner ved checkbox-kolonner
-            header = None
-            body_rows = rows
+    header = rows[0] if rows and any(c.name=="th" for c in _cells(rows[0])) else None
+    body_rows = rows[1:] if header else rows
 
-    # Bygg kolonne-statistikk for ‘checkboxy’ kolonner
-    if not body_rows:
-        return False, [], []
+    if not body_rows: return False, [], [], None
+    num_cols = max(len(_cells(r)) for r in body_rows) or 0
+    if num_cols < 2: return False, [], [], None
 
-    num_cols = max(len(_get_cells(r)) for r in body_rows)
-    if num_cols < 2:
-        return False, [], []
-
-    checkbox_col_idx = set()
-    nonempty_counts = [0]*num_cols
-    checkbox_counts = [0]*num_cols
     row_count = 0
-
+    checkbox_counts = [0]*num_cols
     for r in body_rows:
-        cells = _get_cells(r)
-        if not cells:
-            continue
+        cs = _cells(r)
+        if not cs: continue
         row_count += 1
-        for j, c in enumerate(cells):
+        for j, c in enumerate(cs):
             txt = _text(c)
-            if txt:
-                nonempty_counts[j] += 1
             if _is_checkboxy_cell(c) or not txt.strip():
-                # tomme celler i avkryssingskolonner er vanlig → regn dem som 'checkboxy'-vennlige
                 checkbox_counts[j] += 1
 
-    # En avkryssingskolonne: over 80% "checkboxy" (tomme, x, glyphs, etc.)
-    for j in range(num_cols):
-        if j == 0:
-            continue
-        if row_count and (checkbox_counts[j] / row_count) >= 0.8:
-            checkbox_col_idx.add(j)
+    checkbox_cols = {j for j in range(1, num_cols) if row_count and (checkbox_counts[j]/row_count) >= 0.8}
+    if not checkbox_cols: return False, [], [], None
 
-    if not checkbox_col_idx:
-        # hvis vi ikke finner tydelige checkbox-kolonner → ikke behandl som ticking
-        return False, [], []
-
-    # Hent headings fra header-row for checkbox-kolonner (om mulig)
     headings = []
     if header:
-        header_cells = _get_cells(header)
-        for j, c in enumerate(header_cells):
-            if j == 0:  # første kolonne er påstands-tekst
-                continue
-            if j in checkbox_col_idx:
-                lbl = _text(c)
-                if lbl:
-                    headings.append(lbl.strip())
-    # Filtrer bort tomme headings
-    headings = [h for h in headings if h]
+        for j, c in enumerate(_cells(header)):
+            if j == 0: continue
+            if j in checkbox_cols:
+                h = _text(c).strip()
+                if h: headings.append(h)
 
-    # Hent statements fra body (første kolonne)
+    # påstander = første kolonne
     statements = []
     for r in body_rows:
-        cells = _get_cells(r)
-        if not cells:
-            continue
-        first = cells[0]
-        s = _text(first).strip()
-        if s:
-            statements.append(s)
+        cs = _cells(r)
+        if not cs: continue
+        s = _text(cs[0]).strip()
+        if s: statements.append(s)
 
-    # må ha minst 2 statements for at det skal være meningsfullt
-    if len(statements) < 2:
-        return False, [], []
+    return True, headings, statements, header
 
-    return True, headings, statements
+def _normalize_headings(headings: list[str], lang: str) -> str:
+    # normaliser til Ja/Nei, Riktig/Feil, True/False, Yes/No
+    lower = [h.lower() for h in headings]
+    if {"ja","nei"} <= set(lower): return "Ja/Nei"
+    if {"riktig","feil"} <= set(lower): return "Riktig/Feil"
+    if {"true","false"} <= set(lower): return "True/False"
+    if {"yes","no"} <= set(lower): return "Yes/No"
+    # fallback pr språk
+    if lang.startswith("en"): return "True/False"
+    return "Ja/Nei"
 
-def _existing_generated_list(after_node: Tag):
-    sib = after_node.next_sibling
-    while isinstance(sib, NavigableString) and not sib.strip():
-        sib = sib.next_sibling
-    if isinstance(sib, Tag) and sib.name in {"ol","ul"}:
-        classes = set(sib.get("class", []) or [])
-        if "ticking-boxes-list" in classes:
-            return sib
-    return None
-
-def _make_heading_p(soup, headings: list[str]):
+def _make_head_p(soup, text: str):
     p = soup.new_tag("p")
-    # Slå sammen med " / " (legg inn normalisert mellomrom etter slash)
-    p.string = " / ".join(h.strip() for h in headings if h.strip())
+    p["class"] = ["ticking-boxes-head"]
+    p.string = text
     return p
 
-def _make_list_from_statements(soup, statements: list[str]):
-    ul = soup.new_tag("ul")
-    ul["class"] = ["list-unstyled", "ticking-boxes-list"]
+def _existing_head_p(node_after: Tag) -> Tag | None:
+    # Finn nærmeste forrige <p.ticking-boxes-head>
+    prev = node_after.previous_sibling
+    while isinstance(prev, NavigableString) and not prev.strip():
+        prev = prev.previous_sibling
+    if isinstance(prev, Tag) and prev.name == "p" and "ticking-boxes-head" in (prev.get("class", []) or []):
+        return prev
+    return None
+
+def _existing_ticking_list(node_after: Tag) -> Tag | None:
+    nxt = node_after.next_sibling
+    while isinstance(nxt, NavigableString) and not nxt.strip():
+        nxt = nxt.next_sibling
+    if isinstance(nxt, Tag) and nxt.name in {"ol","ul"} and "ticking-boxes-list" in (nxt.get("class", []) or []):
+        return nxt
+    return None
+
+def _make_list_from_statements(soup, statements: list[str], ordered=True):
+    lst = soup.new_tag("ol" if ordered else "ul")
+    classes = set(lst.get("class", []) or [])
+    classes.add("ticking-boxes-list")
+    if not ordered:
+        classes.add("list-unstyled")
+    lst["class"] = list(classes)
     for s in statements:
         li = soup.new_tag("li")
         li.append(NavigableString(re.sub(r"\s+", " ", s).strip()))
-        ul.append(li)
-    return ul
+        lst.append(li)
+    return lst
+
+def _strip_leading_number(text: str) -> str:
+    return _LEADING_NUM_RX.sub("", text or "").strip()
+
+def _convert_numbered_p_run_to_list(p_run: list[Tag], soup) -> Tag:
+    """Konverter ≥2 nummererte <p> til <ol class='ticking-boxes-list'> og returner lista."""
+    ol = soup.new_tag("ol")
+    ol["class"] = ["ticking-boxes-list"]
+    for p in p_run:
+        li = soup.new_tag("li")
+        li.append(NavigableString(_strip_leading_number(_text(p))))
+        ol.append(li)
+    # Sett inn ol før første p, fjern p-ene
+    first = p_run[0]
+    first.insert_before(ol)
+    for p in p_run:
+        p.decompose()
+    return ol
+
+def _find_numbered_p_run(anchor: Tag) -> list[Tag]:
+    """
+    Finn en sekvens av nummererte <p> rett før/etter 'anchor' (tabellen).
+    Krever minst 2 for å være trygg.
+    """
+    # Sjekk før anchor
+    run = []
+    prev = anchor.previous_sibling
+    while isinstance(prev, NavigableString) and not prev.strip():
+        prev = prev.previous_sibling
+    cur = prev
+    while isinstance(cur, Tag) and cur.name == "p" and _LEADING_NUM_RX.match(_text(cur)):
+        run.insert(0, cur)  # bygg i riktig rekkefølge
+        cur = cur.previous_sibling
+        while isinstance(cur, NavigableString) and not cur.strip():
+            cur = cur.previous_sibling
+    if len(run) >= 2:
+        return run
+    # Sjekk etter anchor
+    run = []
+    nxt = anchor.next_sibling
+    while isinstance(nxt, NavigableString) and not nxt.strip():
+        nxt = nxt.next_sibling
+    cur = nxt
+    while isinstance(cur, Tag) and cur.name == "p" and _LEADING_NUM_RX.match(_text(cur)):
+        run.append(cur)
+        cur = cur.next_sibling
+        while isinstance(cur, NavigableString) and not cur.strip():
+            cur = cur.next_sibling
+    if len(run) >= 2:
+        return run
+    return []
 
 # =============== APPLY REQUIREMENTS ================
 
@@ -9583,64 +9599,61 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     # 2.5.1.17 Tasks with ticking boxes
     # TODO: Check formatting
     """
-    2.5.1.17 Tasks with ticking boxes
-    - Ikke bruk tabeller. Marker påstandene som liste; overskriftsord fra 'ticking box' i <p> før lista.
-    - Vi detekterer tabeller med (minst én) checkbox-kolonne og tar venstre kolonne som tekst.
-    - Idempotent: erstatter evt. tidligere generert liste (class='ticking-boxes-list').
+    2.5.1.17 Ticking boxes
+    - Erstatt tabell-baserte avkryssingsoppsett med <p>H1/H2</p> + <ol>/<ul> av spørsmål.
+    - Fjern tabellen (ikke bruk tabeller).
+    - Idempotent via .ticking-boxes-head / .ticking-boxes-list.
     """
     logger.info("2.5.1.17 - Tasks with ticking boxes")
 
+    lang = _doc_lang(soup)
     tasks = [el for el in soup.find_all(True) if _is_task_container(el)]
     if not tasks:
         logger.info("2.5.1.17 - No task containers found.")
     else:
-        converted = 0
-        updated = 0
-        skipped = 0
-        headings_set = 0
+        converted = updated = headings_set = skipped = 0
 
         for task in tasks:
-            # Kandidater: tabeller i task
-            tables = task.find_all("table")
-            for tbl in tables:
-                ok, headings, statements = _detect_ticking_table(tbl)
+            for tbl in task.find_all("table"):
+                ok, headings, statements_from_table, _ = _detect_ticking_table(tbl)
                 if not ok:
                     continue
 
-                # Finn evt. eksisterende generert liste
-                existing = _existing_generated_list(tbl)
-
-                # Bygg heading <p> (om vi fant kolonneoverskrifter)
-                p_heading = _make_heading_p(soup, headings) if headings else None
-                ul = _make_list_from_statements(soup, statements)
-
-                if existing is not None:
-                    # erstatt eksisterende liste, og evt. oppdatere heading <p>
-                    # sjekk om forrige node (over eksisterende liste) er en <p> med vår heading
-                    prev = existing.previous_sibling
-                    while isinstance(prev, NavigableString) and not prev.strip():
-                        prev = prev.previous_sibling
-                    replaced_heading = False
-                    if p_heading:
-                        if isinstance(prev, Tag) and prev.name == "p":
-                            prev.replace_with(p_heading); replaced_heading = True; headings_set += 1
-                        else:
-                            tbl.insert_after(p_heading); headings_set += 1
-                            p_heading.insert_after(ul)
-                            existing.decompose()
-                            updated += 1
-                            continue
-                    # hvis vi ikke hadde heading eller vi allerede byttet den ut
-                    existing.replace_with(ul)
-                    updated += 1
-                else:
-                    # Sett inn etter tabellen: først heading <p> (om finnes), så lista
-                    if p_heading:
-                        tbl.insert_after(p_heading)
-                        p_heading.insert_after(ul)
-                        headings_set += 1
+                # 1) Finn/lag liste over spørsmål:
+                lst = _existing_ticking_list(tbl)
+                if lst is None:
+                    # forsøk å konvertere nummererte <p>-run rundt tabellen (typisk layout i eksemplet)
+                    p_run = _find_numbered_p_run(tbl)
+                    if p_run:
+                        lst = _convert_numbered_p_run_to_list(p_run, soup)
+                    elif statements_from_table:
+                        lst = _make_list_from_statements(soup, statements_from_table, ordered=True)
+                        tbl.insert_after(lst)
                     else:
-                        tbl.insert_after(ul)
+                        skipped += 1
+                        continue
+
+                # 2) Sett heading-<p> foran lista
+                head_text = _normalize_headings(headings, lang)
+                existing_head = _existing_head_p(lst)
+                if existing_head is None:
+                    head_p = _make_head_p(soup, head_text)
+                    lst.insert_before(head_p)
+                    headings_set += 1
+                else:
+                    if _text(existing_head) != head_text:
+                        existing_head.string = head_text
+                        headings_set += 1
+
+                # 3) Fjern tabellen (spesifikasjonen: do not use tables)
+                try:
+                    tbl.decompose()
+                except Exception:
+                    pass
+
+                if "ticking-boxes-list" in (lst.get("class", []) or []):
+                    updated += 1  # enten ny eller oppdatert representasjon
+                else:
                     converted += 1
 
         logger.info(
