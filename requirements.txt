@@ -1,0 +1,30 @@
+# --- Web API ---
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.29,<0.33
+python-multipart>=0.0.18
+
+# --- XHTML/XML parsing & transformasjoner ---
+beautifulsoup4>=4.12.3,<5.0
+lxml>=5.2.1,<6.0
+
+# --- NLP / språk ---
+nltk>=3.9.1,<4.0
+ipapy==0.0.9.0
+
+# --- Tall / data / plotting (importert i koden) ---
+numpy>=2.0,<3.0
+pandas>=2.2,<3.0
+matplotlib>=3.8,<4.0
+
+# --- Bildebehandling / OCR ---
+pillow>=10.3,<11.0
+pytesseract>=0.3.10,<0.4.0
+# Merk: pytesseract krever systempakken "tesseract-ocr" (apt/apk/yum) installert i imaget.
+
+# --- EPUB validering ---
+epubcheck
+# Merk: Python-pakken "epubcheck" bruker som regel Java under panseret; sørg for at Java/JRE finnes i imaget.
+
+# --- LLM ---
+pika>=1.3,<2
+
