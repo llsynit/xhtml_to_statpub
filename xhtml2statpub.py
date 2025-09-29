@@ -6815,6 +6815,31 @@ def _relocate_pagebreak_at_section_start(soup, pb: Tag) -> bool:
 
     return moved
 
+# --- Hjelpere for § 2.10 -----------------------------------------------------
+
+def _is_header_row(tr: Tag) -> bool:
+    """En rad regnes som 'thead'-rad hvis den har minst én celle og ALLE celler er <th>."""
+    if getattr(tr, "name", "") != "tr":
+        return False
+    cells = [c for c in tr.find_all(["th", "td"], recursive=False)]
+    return bool(cells) and all(c.name == "th" for c in cells)
+
+def _assign_scopes(thead: Tag | None, tbody: Tag | None):
+    # th i thead → scope="col"
+    if thead:
+        for th in thead.find_all("th"):
+            if not th.has_attr("scope"):
+                th["scope"] = "col"
+    # th i tbody som første celle i en rad → scope="row"
+    if tbody:
+        for tr in tbody.find_all("tr", recursive=True):
+            cells = [c for c in tr.find_all(["th", "td"], recursive=False)]
+            if not cells:
+                continue
+            first = cells[0]
+            if first.name == "th" and not first.has_attr("scope"):
+                first["scope"] = "row"
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -11548,18 +11573,97 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         )
 
     # 2.10 Tables
-    logger.info('2.10 - Tables')
-    for table in soup('table'):
-        if not table.find(['thead','tbody']):
-            thead = soup.new_tag('thead')
-            tbody = soup.new_tag('tbody')
-            table.append(thead)
-            table.append(tbody)
-            for tr in table('tr'):
-                if tr.find('th'):
-                    thead.insert(len(thead.contents), tr)
-                else:
-                    tbody.insert(len(tbody.contents), tr)
+    """
+    2.10 Tables
+    - HTML5-vennlig struktur: <thead>, <tbody>, (ev. <tfoot>).
+    - Ledende rader med bare <th> flyttes til <thead>.
+    - Resten flyttes til <tbody>.
+    - Bevar/sett riktig rekkefølge og 'scope' på <th>.
+    """
+    logger.info("2.10 - Tables")
+
+    tables = soup.find_all("table")
+    if not tables:
+        logger.info("2.10 - No tables found.")
+    else:
+        fixed = created_head = created_body = moved_rows = 0
+
+        for table in tables:
+            # Finn eksisterende direkte barn
+            caption = table.find("caption", recursive=False)
+            thead   = table.find("thead",   recursive=False)
+            tbody   = table.find("tbody",   recursive=False)
+            tfoot   = table.find("tfoot",   recursive=False)
+
+            # Samle <tr> som ligger *direkte* under <table> (dvs. feil struktur)
+            direct_trs = [tr for tr in table.find_all("tr", recursive=False)]
+
+            # Opprett seksjoner ved behov (men append bare hvis de får innhold)
+            created_local_head = False
+            created_local_body = False
+            if thead is None:
+                thead = soup.new_tag("thead")
+                created_local_head = True
+            if tbody is None:
+                tbody = soup.new_tag("tbody")
+                created_local_body = True
+
+            # Hvis vi har direkte tr-barn: fordel dem til thead/tbody
+            header_run = 0
+            if direct_trs:
+                for tr in direct_trs:
+                    if _is_header_row(tr):
+                        header_run += 1
+                    else:
+                        break
+
+                for i, tr in enumerate(direct_trs):
+                    tr.extract()
+                    if i < header_run:
+                        thead.append(tr)
+                    else:
+                        tbody.append(tr)
+                    moved_rows += 1
+
+            # Hvis vi opprettet thead/tbody, men de er tomme, skal de ikke nødvendigvis inn i DOM.
+            # Men hvis de har innhold (eller fantes fra før), sørg for riktig rekkefølge.
+            def _append_if_needed(node: Tag | None):
+                if node and node.parent is None and node.find("tr"):
+                    table.append(node)
+
+            # Rydd rekkefølge: caption (om finnes) først, så thead, tbody, tfoot.
+            # Ta ut thead/tbody/tfoot og sett inn på nytt i rett rekkefølge.
+            # (caption lar vi stå som er, men hvis noen har tuklet rekkefølgen, sørger vi for korrekt.)
+            for sec in (thead, tbody, tfoot):
+                if sec and sec.parent is table:
+                    sec.extract()
+
+            # caption skal være først
+            if caption and caption.parent is table:
+                caption.extract()
+                table.insert(0, caption)
+
+            # Sett inn thead/tbody/tfoot om de har innhold
+            _append_if_needed(thead)
+            _append_if_needed(tbody)
+            if tfoot and tfoot.parent is None:
+                table.append(tfoot)
+
+            # Sett scope-attributter for tilgjengelighet
+            _assign_scopes(thead if thead.parent is table else None,
+                           tbody if tbody.parent is table else None)
+
+            # Statistikk
+            if created_local_head and thead.parent is table and thead.find("tr"):
+                created_head += 1
+            if created_local_body and tbody.parent is table and tbody.find("tr"):
+                created_body += 1
+            fixed += 1
+
+        logger.info(
+            "2.10 - Done. tables=%d, created thead=%d, created tbody=%d, moved rows=%d",
+            fixed, created_head, created_body, moved_rows
+        )
 
     # 2.10.1 Table titles
     logger.info('2.10.1 - Table titles')
