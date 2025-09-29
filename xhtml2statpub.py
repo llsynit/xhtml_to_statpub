@@ -7043,6 +7043,128 @@ def _collapse_consecutive_br(cell):
         else:
             prev_br = False
 
+# --- Hjelpere for § 2.10.5 -----------------------------------------------------
+
+_BULLET_CHARS = "•●○–—\\-▪■‣∙·*‒•"  # utvidbar
+_BULLET_RX = re.compile(rf"^\s*([{_BULLET_CHARS}]+)\s+")
+_ROMAN_RX  = re.compile(r"^\s*[ivxlcdm]+\s*[\)\.]?\s*", re.I)  # iv)  ix.  etc.
+_ALPHA_RX  = re.compile(r"^\s*[a-z]\s*[\)\.]?\s*", re.I)       # a)  b.  etc.
+
+def _has_math(tag):
+    if tag.find("math"):
+        return True
+    cls = " ".join(tag.get("class", [])).lower()
+    if "asciimath" in cls:
+        return True
+    txt = tag.get_text("", strip=True)
+    if "$" in txt or r"\(" in txt or r"\[" in txt:
+        return True
+    return False
+
+def _li_direct_ps(li):
+    return [c for c in li.find_all("p", recursive=False)]
+
+def _unwrap_single_p_if_simple(li):
+    """Unwrapper én enkel <p> når den er eneste innholdet i <li> og uten 'tunge' attrs/blocks."""
+    ps = _li_direct_ps(li)
+    # Ikke unwrap hvis andre blokker er direkte barn av li
+    other_blocks = [c for c in li.children
+                    if getattr(c, "name", None) not in (None, "p") and c.name in {
+                        "address","article","aside","blockquote","canvas","div","dl","fieldset",
+                        "figcaption","figure","footer","form","h1","h2","h3","h4","h5","h6",
+                        "header","hr","li","main","nav","noscript","ol","pre","section",
+                        "table","tbody","thead","tfoot","tr","th","td","ul"
+                    }]
+    if len(ps) == 1 and not other_blocks:
+        p = ps[0]
+        if not p.attrs and not p.find(True):
+            # flytt ren tekst/inline ut
+            for n in list(p.contents):
+                p.insert_before(n.extract())
+            p.decompose()
+            return True
+    return False
+
+def _merge_multi_p_with_br(li, soup):
+    """Slå sammen flere <p> til tekst med <br>, hvis det ikke finnes andre blokker."""
+    ps = _li_direct_ps(li)
+    if len(ps) < 2:
+        return False
+    # Ikke rør om li har andre blokker direkte (lister, figurer, tabeller, osv)
+    other_blocks = [c for c in li.children if getattr(c, "name", None) not in (None, "p")]
+    if other_blocks:
+        return False
+    # Ikke slå sammen hvis noen p har blokkelementer inni
+    for p in ps:
+        if p.find(True):
+            return False
+    # Merge
+    for i, p in enumerate(ps):
+        for n in list(p.contents):
+            p.insert_before(n.extract())
+        if i < len(ps) - 1:
+            p.insert_before(soup.new_tag("br"))
+        p.decompose()
+    return True
+
+def _strip_leading_bullet_in_li(li):
+    """Fjern synlig kule/dash i starten av første tekst i <li>. Returnerer True om noe ble fjernet."""
+    # Finn første NavigableString eller tekstnær node
+    for node in li.contents:
+        if isinstance(node, NavigableString):
+            m = _BULLET_RX.match(str(node))
+            if m:
+                node.replace_with(_BULLET_RX.sub("", str(node), count=1))
+                return True
+        elif getattr(node, "name", None):
+            # hvis node er f.eks. <span>tekst…</span> som starter med kule
+            t = node.get_text("", strip=False)
+            m = _BULLET_RX.match(t)
+            if m and node.string is not None:
+                node.string.replace_with(_BULLET_RX.sub("", t, count=1))
+                return True
+        # stopp ved første ikke-tomme innhold
+        if (isinstance(node, NavigableString) and node.strip()) or getattr(node, "name", None):
+            break
+    return False
+
+def _ul_needs_plain_class(ul):
+    """Vurder om <ul> skal ha list-unstyled etter at synlige kuler er fjernet."""
+    # Hvis ingen li lenger starter med kuletegn → plain
+    for li in ul.find_all("li", recursive=False):
+        # se råtekst for første tekstbit
+        first_txt = li.get_text("", strip=False)
+        if _BULLET_RX.match(first_txt):
+            return False
+    return True
+
+def _mark_ol_nonstandard(ol):
+    """Oppdag 'ikke-standard' nummerering (romersk, bokstav, blandet) og sett plain-klassene."""
+    # Hvis type-attr allerede er a/A/i/I → plain
+    t = (ol.get("type") or "").lower()
+    if t in {"a","i"}:
+        return True
+    # Sjekk første par li for prefiksmønster
+    lis = ol.find_all("li", recursive=False)[:4]
+    hits = 0
+    for li in lis:
+        text = li.get_text(" ", strip=True)
+        if _ROMAN_RX.match(text) or _ALPHA_RX.match(text):
+            hits += 1
+    return hits >= max(1, len(lis)//2)
+
+def _ensure_class(dct, val):
+    cls = set(dct.get("class", []) or [])
+    if val not in cls:
+        cls.add(val)
+        dct["class"] = list(cls)
+
+def _ensure_style_none(tag):
+    style = (tag.get("style") or "").strip()
+    if "list-style-type: none" not in style.replace(" ", "").lower():
+        tag["style"] = (style + ("; " if style else "") + "list-style-type: none;").strip()
+
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -12100,6 +12222,46 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
     # 2.10.5 Lists within tables
     # Already implemented by SMR 2.4
+    stats = {"li_p_unwrapped":0, "li_p_merged":0, "bullets_stripped":0, "ul_plain_set":0, "ol_plain_nonstd":0, "skipped_math_cell":0}
+
+    for cell in soup.find_all(["td","th"]):
+        # hopp matte-celler
+        if _has_math(cell):
+            stats["skipped_math_cell"] += 1
+            continue
+
+        # Finn lister direkte inne i cellen (eller dypere – lister kan ligge et nivå ned)
+        for lst in cell.find_all(["ul","ol"]):
+            # 2.4.3: P i LI
+            for li in lst.find_all("li", recursive=False):
+                if _unwrap_single_p_if_simple(li):
+                    stats["li_p_unwrapped"] += 1
+                elif _merge_multi_p_with_br(li, soup):
+                    stats["li_p_merged"] += 1
+
+            # 2.4.2: Kuletegn i UL
+            if lst.name == "ul":
+                any_stripped = False
+                for li in lst.find_all("li", recursive=False):
+                    if _strip_leading_bullet_in_li(li):
+                        any_stripped = True
+                        stats["bullets_stripped"] += 1
+                # Sett list-unstyled når listen ikke har synlige kuler/dash
+                if _ul_needs_plain_class(lst):
+                    _ensure_class(lst.attrs, "list-unstyled")
+                    stats["ul_plain_set"] += 1
+
+            # 2.4.1.3: Ikke-standard OL → plain
+            if lst.name == "ol" and _mark_ol_nonstandard(lst):
+                _ensure_class(lst.attrs, "list-type-none")
+                _ensure_style_none(lst)
+                stats["ol_plain_nonstd"] += 1
+
+    logger.info(
+        "2.10.5 - Done. Unwrapped LI<p>=%d, merged LI<p>=%d, bullets stripped=%d, ul plain set=%d, ol nonstd plain=%d, math cells skipped=%d",
+        stats["li_p_unwrapped"], stats["li_p_merged"], stats["bullets_stripped"], stats["ul_plain_set"],
+        stats["ol_plain_nonstd"], stats["skipped_math_cell"]
+    )
 
     # 2.10.6 Tables where all table cells are empty
     logger.info('2.10.6 - Tables where all table cells are empty')
