@@ -5168,6 +5168,87 @@ def _mk_ul_unstyled(soup):
     ul["class"] = ["list-unstyled", "generated-unstyled"]
     return ul
 
+# --- Hjelpere for 2.5.1.15 ----------------------------------------------------
+
+_TASKISH_TOKENS = {
+    "assessment","assessments",
+    "exercise","exercises",
+    "practice","task","tasks",
+    "question","questions",
+    "answer","answers","key","fasit"
+}
+
+_STD_INT_TOKEN_RX   = re.compile(r'^\s*\d+[\.\):]?\s+')   # 1.  / 1)  / 1:
+_STD_ROMAN_TOKEN_RX = re.compile(r'^\s*[IVXLCDM]+[\.\):]\s+', re.I)  # IX. / iv)
+_NONSTD_TOKEN_RX    = re.compile(
+    r'^\s*(?:'            # start
+    r'\d+[A-Za-z]'        # 1A, 10a, 2b
+    r'|'                  
+    r'(?:\d+\.)+\d+[A-Za-z]?'  # 2.10c, 3.2, 4.5.1
+    r'|'                  
+    r'[A-Za-z]\d+'        # A1, B12
+    r')'
+)
+
+def _epub_types(el: Tag) -> set[str]:
+    t = (el.get("epub:type") or "").lower()
+    return set(t.replace(";", " ").split()) if t else set()
+
+def _is_task_container(el: Tag) -> bool:
+    if not getattr(el, "name", None):
+        return False
+    cls = set(el.get("class", []) or [])
+    if "task" in cls or "key" in cls:
+        return True
+    return bool(_epub_types(el) & _TASKISH_TOKENS)
+
+def _leading_token_kind(text: str) -> str:
+    """Returner 'std', 'roman', 'nonstd' eller 'none' basert på ledetekst."""
+    s = (text or "")
+    if _STD_INT_TOKEN_RX.match(s):
+        return "std"
+    if _STD_ROMAN_TOKEN_RX.match(s):
+        return "roman"  # betrakter vi som 'std' i denne sammenheng
+    if _NONSTD_TOKEN_RX.match(s):
+        return "nonstd"
+    return "none"
+
+def _to_ol(element: Tag, soup) -> Tag:
+    """Konverter <ul>→<ol> idempotent. Returner <ol>."""
+    if element.name == "ol":
+        return element
+    ol = soup.new_tag("ol")
+    # flytt klasser/attrs med unntak av 'type' (irrelevant) – men vi overskriver klassene senere
+    for k, v in list(element.attrs.items()):
+        if k not in {"type"}:
+            ol.attrs[k] = v
+    for c in list(element.contents):
+        ol.append(c.extract())
+    element.replace_with(ol)
+    return ol
+
+def _mark_list_type_none(ol: Tag):
+    """Sett class='list-type-none' og style for list-style-type:none; idempotent."""
+    # klasser
+    classes = set(ol.get("class", []) or [])
+    if "list-type-none" not in classes:
+        classes.add("list-type-none")
+        ol["class"] = list(classes)
+    # style
+    style = (ol.get("style") or "")
+    if "list-style-type" not in style.lower():
+        if style and not style.strip().endswith(";"):
+            style += ";"
+        style += " list-style-type: none;"
+        ol["style"] = style.strip()
+    # fjern ol-type/start; li-value
+    for attr in ("type", "start"):
+        if attr in ol.attrs:
+            del ol.attrs[attr]
+    for li in ol.find_all("li", recursive=False):
+        if "value" in li.attrs:
+            del li.attrs["value"]
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -9081,12 +9162,53 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         logger.info("2.5.1.14 - Done. normalized_uls=%d, p_runs_converted=%d", normalized_uls, converted_runs)
 
     # 2.5.1.15 Lists of tasks with non-standard numbering
-    logger.info('2.5.1.15 Lists of tasks with non-standard numbering')
-    for list_element in soup(['ol', 'ul']):
-        if is_task(list_element) or is_part_of_task(list_element):
-            if nordic.is_non_standard_list(list_element):
-                list_element['class'] = 'list-type-none'
-                list_element['style'] = 'list-style-type: none;'
+    """
+    2.5.1.15 Lists of tasks with non-standard numbering
+    - Inne i oppgaver: oppdag ikke-standard nummerering (1A, 2.10c, A1, ...).
+    - Konverter til <ol class="list-type-none" style="list-style-type: none;">.
+    - Behold nummer i li-teksten, fjern 'type'/ 'start'/ 'value'.
+    """
+    logger.info('2.5.1.15 - Lists of tasks with non-standard numbering')
+
+    # Finn alle oppgavecontainere
+    tasks = [el for el in soup.find_all(True) if _is_task_container(el)]
+    if not tasks:
+        logger.info("2.5.1.15 - No task containers found.")
+    else:
+        converted = 0
+        normalized = 0
+        skipped = 0
+
+        for task in tasks:
+            for lst in task.find_all(["ol", "ul"]):
+                # Se kun på toppnivå-listeelementer (ikke rekursivt inn i nested lister)
+                lis = lst.find_all("li", recursive=False)
+                if not lis:
+                    continue
+                kinds = [_leading_token_kind(li.get_text(" ", strip=True)) for li in lis]
+
+                # Klassifisering: "nonstd" hvis minst én nonstd og ikke alle er rene std/roman/none
+                has_nonstd = any(k == "nonstd" for k in kinds)
+                all_std_or_roman = all(k in {"std", "roman"} for k in kinds if k != "none")
+
+                if has_nonstd:
+                    # Sørg for <ol> og 'list-type-none'
+                    ol = _to_ol(lst, soup)
+                    _mark_list_type_none(ol)
+                    converted += 1
+                else:
+                    # Ingen tydelige ikke-standard markører – men dersom UL tydelig starter med tall (std),
+                    # lar vi den være. Hvis OL allerede er 'list-type-none', bare normaliser.
+                    if lst.name == "ol":
+                        # Hvis allerede list-type-none, normaliser stil/attrs
+                        cls = set(lst.get("class", []) or [])
+                        if "list-type-none" in cls:
+                            _mark_list_type_none(lst)
+                            normalized += 1
+                    else:
+                        skipped += 1
+
+        logger.info("2.5.1.15 - Done. converted=%d, normalized=%d, skipped=%d", converted, normalized, skipped)
 
     # 2.5.1.16 Tasks where examples of answers are given
     logger.info('2.5.1.16 Tasks where examples of answers are given')
