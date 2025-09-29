@@ -6275,6 +6275,148 @@ def _comment_to_li(soup, box: Tag) -> Tag:
             li.append(NavigableString(txt))
     return li
 
+# --- Hjelpere for § 2.8.1 -----------------------------------------------------
+
+# Dialogcue: "Navn:" eller "Navn -"/"Navn —" i starten av et avsnitt
+# Tillater norske bokstaver og punktum/streker i navn (H. Ibsen, Fru Alving, etc.)
+_SPEAKER_RX = re.compile(
+    r"^\s*([A-ZÆØÅ][\wÆØÅæøå\.\- ]{0,50}?)\s*([:–—-])\s+",
+    flags=re.UNICODE
+)
+
+_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
+
+def _nearest_section(node: Tag):
+    anc = node
+    while anc is not None and getattr(anc, "name", None) != "section":
+        anc = anc.parent
+    return anc
+
+def _mark_section_as_play(section: Tag):
+    if not section or not isinstance(section, Tag):
+        return False
+    cls = set(section.get("class", []) or [])
+    if "play" not in cls:
+        cls.add("play")
+        section["class"] = sorted(cls)
+        return True
+    return False
+
+def _ensure_play_container(soup, node: Tag):
+    """
+    Sørg for at linjen ligger i en seksjon som er merket 'play'.
+    Bruk nærmeste <section>. Hvis ingen finnes, opprett en lett seksjon rundt p-blokken.
+    """
+    sec = _nearest_section(node)
+    if sec:
+        _mark_section_as_play(sec)
+        return sec
+
+    # Opprett en 'auto'-seksjon rundt avsnittet hvis den ikke ligger i en seksjon.
+    auto = soup.new_tag("section")
+    auto["class"] = ["play"]
+    auto["data-auto-play"] = "true"
+    node.insert_before(auto)
+    auto.append(node.extract())
+    return auto
+
+def _is_entirely_italic_p(p: Tag) -> bool:
+    """
+    Returner True hvis avsnittet i praksis bare er kursiv (klassisk tegn på regianvisning).
+    """
+    if p is None or not isinstance(p, Tag) or p.name != "p":
+        return False
+    # Kun én child og den er <em>/<i> (og uten videre blokker)
+    if len([c for c in p.contents if not (isinstance(c, NavigableString) and not c.strip())]) != 1:
+        return False
+    child = p.contents[0]
+    return isinstance(child, Tag) and child.name in {"em", "i"} and not child.find(["p","div","ul","ol","table","section","figure"])
+
+def _looks_like_stage_direction_text(text: str) -> bool:
+    """
+    Enkel heuristikk: hele linjen er én parantessetning, eller kort 'regi'-tekst.
+    """
+    if not text:
+        return False
+    t = text.strip()
+    # (Han går mot døren.)
+    if len(t) <= 240 and t.startswith("(") and t.endswith(")"):
+        return True
+    # korte regisnutter uten dialogcue
+    if len(t) <= 120 and any(tok in t.lower() for tok in ("(", "exit", "pause", "stille", "banker", "sukker", "ser", "går", "trår", "roper")):
+        # vær konservativ – må ikke starte med typisk setningsstart + kolon
+        if not _SPEAKER_RX.match(t):
+            return True
+    return False
+
+def _wrap_speaker_span_in_p(soup, p: Tag, match: re.Match) -> bool:
+    """
+    Pakk talerens navn (før kolon/strekk) i <span class="speaker">…: </span>.
+    Idempotent: gjør ingenting hvis span allerede finnes i starten.
+    """
+    if not p or not isinstance(p, Tag) or p.name != "p":
+        return False
+    # Sjekk om p allerede starter med <span class="speaker">
+    first_el = None
+    for c in p.contents:
+        if isinstance(c, NavigableString) and not c.strip():
+            continue
+        first_el = c
+        break
+    if isinstance(first_el, Tag) and first_el.name == "span" and "speaker" in (first_el.get("class", []) or []):
+        return False  # allerede pakket
+
+    # Vi forsøker å operere på første tekstnode i <p>
+    # Hvis første ikke er tekstnode, men enkel <em>/<strong>/<span> uten dyp struktur,
+    # kan vi hente dens tekst, men for enkelhet opererer vi primært på tekstnode.
+    if not p.contents:
+        return False
+
+    # Finn første NavigableString i starten (hopper over tomme)
+    first_text_idx = None
+    for idx, c in enumerate(p.contents):
+        if isinstance(c, NavigableString):
+            s = str(c)
+            if s:
+                first_text_idx = idx
+                break
+        elif isinstance(c, Tag):
+            # Enkel case: inline container som bare har tekst (uten dyp struktur)
+            if c.name in {"em","strong","b","i","span"} and c.get_text("", strip=False) and not c.find(True):
+                # løft teksten ut til tekstnode i p for enklere behandling
+                txt = c.get_text("", strip=False)
+                c.replace_with(NavigableString(txt))
+                first_text_idx = idx
+                break
+        # ellers fortsetter vi (kan være whitespace e.l.)
+
+    if first_text_idx is None:
+        return False
+
+    text_node = p.contents[first_text_idx]
+    txt = str(text_node)
+    m = _SPEAKER_RX.match(txt)
+    if not m:
+        return False
+
+    name = m.group(1).strip()
+    delim = m.group(2)
+
+    # Bygg speaker-span med kolon/strektegn + trailing space inni
+    span = soup.new_tag("span")
+    span["class"] = ["speaker"]
+    span.append(f"{name}{delim} ")
+
+    # Resten av avsnittet (bevar etterfølgende tekst fra denne noden)
+    rest = txt[m.end():]
+
+    # Erstatt første tekstnode med speaker-span (+ rest dersom finnes)
+    text_node.replace_with(span)
+    if rest:
+        span.insert_after(NavigableString(rest))
+
+    return True
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -10840,6 +10982,98 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
     # 2.8.1 Plays and screenplays
     # TODO: find formatting. Make interactive
+    """
+    2.8.1 Plays and screenplays
+    - Merk seksjon(er) med class="play".
+    - Pakk talernavn i <span class="speaker">…: </span>.
+    - Merk regianvisning-avsnitt med <p class="directions">.
+    - Idempotent; valgfri LLM for tvilstilfeller.
+    """
+    logger.info("2.8.1 - Plays and screenplays")
+
+    llm = None
+    if use_llm and "._ensure_llm_client" in str(globals().get("_ensure_llm_client", "")):
+        try:
+            llm = _ensure_llm_client(logger, use_llm)
+        except Exception:
+            llm = None
+
+    speaker_lines = 0
+    directions = 0
+    play_sections_marked = 0
+
+    # Enkel heuristikk: ser vi mange 'Navn:'-linjer i en region,
+    # vil _ensure_play_container markere/etablere class="play".
+    # Vi prosesserer alle <p>.
+    for p in soup.find_all("p"):
+        if not isinstance(p, Tag):
+            continue
+
+        # Hopp over allerede markerte speaker/directions
+        if p.find("span", class_="speaker"):
+            continue
+        if "directions" in (p.get("class", []) or []):
+            continue
+
+        raw_text = p.get_text("", strip=False) or ""
+
+        # 1) Forsøk speaker-matching
+        m = _SPEAKER_RX.match(raw_text)
+        is_speaker = bool(m)
+        is_direction = False
+
+        # 2) Hvis ikke sikker: bruk LLM ved behov
+        if not is_speaker and use_llm and llm and getattr(llm, "available", False):
+            try:
+                prev_txt = ""
+                nxt_txt = ""
+                prev = p.find_previous("p")
+                if prev: prev_txt = prev.get_text(" ", strip=True)
+                nxt = p.find_next("p")
+                if nxt: nxt_txt = nxt.get_text(" ", strip=True)
+                resp = llm.classify_play_line(
+                    html_snippet=str(p)[:2000],
+                    prev_text=prev_txt[:400],
+                    next_text=nxt_txt[:400]
+                ) or {}
+                lbl = (resp.get("type") or "").lower()
+                if lbl == "speaker":
+                    is_speaker = True
+                elif lbl == "directions":
+                    is_direction = True
+            except Exception:
+                pass
+
+        # 3) Ikke LLM / heuristikk for regilinjer
+        if not is_speaker and not is_direction:
+            if _is_entirely_italic_p(p) or _looks_like_stage_direction_text(raw_text):
+                is_direction = True
+
+        if is_speaker:
+            if _wrap_speaker_span_in_p(soup, p, _SPEAKER_RX.match(raw_text)):
+                sec = _ensure_play_container(soup, p)
+                if sec and "play" in (sec.get("class", []) or []):
+                    play_sections_marked += 1  # teller løst – kan bli høy; loggen er informativ
+                speaker_lines += 1
+            continue
+
+        if is_direction:
+            classes = set(p.get("class", []) or [])
+            if "directions" not in classes:
+                classes.add("directions")
+                p["class"] = sorted(classes)
+                sec = _ensure_play_container(soup, p)
+                if sec and "play" in (sec.get("class", []) or []):
+                    play_sections_marked += 1
+                directions += 1
+            continue
+
+        # Narrativt avsnitt – ikke rør
+
+    logger.info(
+        "2.8.1 - Done. speaker_lines=%d, directions=%d, play_sections_touched~=%d",
+        speaker_lines, directions, play_sections_marked
+    )
 
     # 2.9 Page breaks
     logger.info('2.9 - Page breaks')
