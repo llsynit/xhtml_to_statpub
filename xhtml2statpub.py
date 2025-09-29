@@ -7165,6 +7165,83 @@ def _ensure_style_none(tag):
         tag["style"] = (style + ("; " if style else "") + "list-style-type: none;").strip()
 
 
+# --- Hjelpere for § 2.10.6 -----------------------------------------------------
+
+EMPTY_TOKENS = {"", "-", "–", "—", ".", "…", "•", "·", "\u00A0"}
+
+def _norm_text(s: str | None) -> str:
+    return (s or "").replace("\u00A0", " ").strip()
+
+def _cell_is_empty(cell):
+    # Har cellen “innhold” som må bevares? (da er den ikke tom)
+    if cell.find(["img","svg","object","iframe","math","canvas","video","audio","picture","source"]):
+        return False
+    t = _norm_text(cell.get_text(" ", strip=True))
+    return t in EMPTY_TOKENS
+
+def _extract_caption_text(table):
+    cap = table.find("caption")
+    if cap:
+        return cap.get_text(" ", strip=True)
+    title = table.get("title")
+    if title:
+        return str(title).strip()
+    return None
+
+def _header_row_cells(table):
+    # Foretrekk thead → første tr
+    thead = table.find("thead")
+    if thead:
+        tr = thead.find("tr")
+        return tr.find_all(["th","td"], recursive=False) if tr else []
+    # Ellers: første rad som inneholder th
+    for tr in table.find_all("tr"):
+        cells = tr.find_all(["th","td"], recursive=False)
+        if any(c.name == "th" for c in cells):
+            return cells
+    # Fallback: første rad
+    tr = table.find("tr")
+    return tr.find_all(["th","td"], recursive=False) if tr else []
+
+def _col_headings(table):
+    cells = _header_row_cells(table)
+    out = []
+    for c in cells:
+        scope = (c.get("scope") or "").lower()
+        if c.name == "th" or scope == "col":
+            txt = _norm_text(c.get_text(" ", strip=True))
+            if txt:
+                out.append(txt)
+    return out
+
+def _row_headings(table, header_row=None):
+    out = []
+    rows = table.find_all("tr")
+    for tr in rows:
+        if header_row is not None and tr is header_row:
+            continue
+        cells = tr.find_all(["th","td"], recursive=False)
+        if not cells:
+            continue
+        first = cells[0]
+        scope = (first.get("scope") or "").lower()
+        if first.name == "th" or scope == "row":
+            txt = _norm_text(first.get_text(" ", strip=True))
+            if txt:
+                out.append(txt)
+    return out
+
+def _mk_ul(items, cls):
+    if not items:
+        return None
+    ul = soup.new_tag("ul")
+    ul["class"] = ["list-unstyled", cls]
+    for it in items:
+        li = soup.new_tag("li")
+        li.string = it
+        ul.append(li)
+    return ul
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -12264,20 +12341,63 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     )
 
     # 2.10.6 Tables where all table cells are empty
-    logger.info('2.10.6 - Tables where all table cells are empty')
-    # TODO: Check lists marked up as figures?
-    for table in soup('table'):
-        if (all([not cell.text or re.compile(r' +').match(cell.text) for cell in table('td')]) and
-            (ths := table('th', text=True))):
-            figure      = soup.new_tag('figure')
-            headings    = [th.string for th in table('th')]
-            ol          = soup.new_tag('ol')
-            for th in ths:
-                ol.append((li := soup.new_tag('li')))
-                li.append(th.get_text())
-            figure.append(ol)
-            table.insert_before(figure)
-            table.decompose()
+    converted = 0
+    skipped_not_empty = 0
+    skipped_no_headings = 0
+
+    for table in list(soup.find_all("table")):
+        # Idempotens: hopp over hvis allerede prosessert
+        if table.get("data-processed-empty") == "true":
+            continue
+
+        tds = table.find_all("td")
+        if not tds:
+            # Ingen <td> → dette kravet gjelder ikke eksplisitt (kan være ren header-tabell)
+            continue
+
+        # Alle `td` må være tomme
+        if not all(_cell_is_empty(td) for td in tds):
+            skipped_not_empty += 1
+            continue
+
+        # Finn header-rad for å kunne hoppe over den når vi henter radoreskrifter
+        header_cells = _header_row_cells(table)
+        header_row = header_cells[0].parent if header_cells else None
+
+        cols = _col_headings(table)
+        rows = _row_headings(table, header_row=header_row)
+
+        if not cols and not rows:
+            # Uten kolonne-/radoreskrifter gir det lite mening å erstatte med lister
+            skipped_no_headings += 1
+            continue
+
+        # Bygg figure
+        fig = soup.new_tag("figure")
+        fig["class"] = ["empty-table-headings"]
+        if table.get("id"):
+            fig["data-from-table-id"] = table["id"]
+
+        cap_text = _extract_caption_text(table)
+        if cap_text:
+            fc = soup.new_tag("figcaption")
+            fc.string = cap_text
+            fig.append(fc)
+
+        ul_cols = _mk_ul(cols, "col-headings")
+        ul_rows = _mk_ul(rows, "row-headings")
+        if ul_cols: fig.append(ul_cols)
+        if ul_rows: fig.append(ul_rows)
+
+        table.insert_before(fig)
+        table["data-processed-empty"] = "true"
+        table.decompose()
+        converted += 1
+
+    logger.info(
+        "2.10.6 - Done. Converted tables: %d, skipped (not all cells empty): %d, skipped (no headings found): %d",
+        converted, skipped_not_empty, skipped_no_headings
+    )
 
     # 2.10.7 Do not use tables purely as a formatting tool
     # TODO: The conversion of table to list should be done interactively
