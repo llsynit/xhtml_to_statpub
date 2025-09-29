@@ -6987,6 +6987,62 @@ def _normalize_cell_to_ul(cell: Tag, soup, logger) -> bool:
     cell.append(ul)
     return True
 
+# --- Hjelpere for § 2.10.4 -----------------------------------------------------
+
+
+_BLOCK_TAGS = {
+    "address","article","aside","blockquote","canvas","div","dl","fieldset",
+    "figcaption","figure","footer","form","h1","h2","h3","h4","h5","h6",
+    "header","hr","li","main","nav","noscript","ol","p","pre","section",
+    "table","tbody","thead","tfoot","tr","th","td","ul"
+}
+
+def _has_math_content(tag):
+    if tag.find("math"):
+        return True
+    classes = " ".join(tag.get("class", [])).lower()
+    if "asciimath" in classes:
+        return True
+    txt = tag.get_text("", strip=True)
+    if "$" in txt or r"\(" in txt or r"\[" in txt:
+        return True
+    return False
+
+def _has_block_descendants(tag):
+    for d in tag.descendants:
+        if getattr(d, "name", None) in _BLOCK_TAGS and d is not tag:
+            # tillat <br> (inline)
+            if d.name == "br":
+                continue
+            return True
+    return False
+
+def _p_has_significant_attrs(p):
+    # behold p hvis den har meningsfulle attributter som vi ikke vil miste
+    if p.attrs:
+        # noen ganger kommer tom class/id/style – filtrer på faktiske verdier
+        for k, v in p.attrs.items():
+            if v not in (None, "", [], {}):
+                return True
+    return False
+
+def _cell_direct_ps(cell):
+    # direkte-barn <p> (ikke dype)
+    return [c for c in cell.find_all("p", recursive=False)]
+
+def _collapse_consecutive_br(cell):
+    prev_br = False
+    for node in list(cell.children):
+        if getattr(node, "name", "") == "br":
+            if prev_br:
+                node.decompose()
+            prev_br = True
+        elif isinstance(node, str) and not node.strip():
+            # ignorer blanktekst ift. br-samling
+            continue
+        else:
+            prev_br = False
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -11981,11 +12037,66 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
     # 2.10.4 Avoid use of <p> within table cells
     logger.info('2.10.4 - Avoid use of <p> within table cells')
-    for cell in soup(['th', 'td']):
-        # Only one <p> is deemed redundant. TODO: check other options
-        if len(cell('p')) == 1:
-            # cell.p.unwrap()
-            pass # The <p> might be necessary for the spine
+
+
+    unwrapped_single = merged_multi = skipped = 0
+
+    for cell in soup.find_all(["td", "th"]):
+        # hopp celler med tydelig matematikk
+        if _has_math_content(cell):
+            skipped += 1
+            continue
+
+        ps = _cell_direct_ps(cell)
+        if not ps:
+            continue
+
+        # Hvis cellen inneholder andre blokker i tillegg til p (lister, figurer, tabeller, osv.),
+        # la stå – her er <p> ofte nødvendig for struktur/lesbarhet
+        other_blocks = [c for c in cell.children
+                        if getattr(c, "name", None) and c.name in _BLOCK_TAGS and c.name != "p"]
+        if other_blocks:
+            skipped += 1
+            continue
+
+        # 1) Én enkel <p> som eneste innhold -> unwrap hvis trygg
+        non_ws_children = [c for c in cell.children if not (isinstance(c, str) and not c.strip())]
+        if len(ps) == 1 and len(non_ws_children) == 1:
+            p = ps[0]
+            if not _p_has_significant_attrs(p) and not _has_block_descendants(p):
+                # flytt innhold ut og fjern p
+                for n in list(p.contents):
+                    p.insert_before(n.extract())
+                p.decompose()
+                unwrapped_single += 1
+            else:
+                skipped += 1
+            continue
+
+        # 2) Flere <p> i samme celle, og cellen har ikke andre blokkelementer -> slå sammen med <br>
+        # Bevar inline-formattering ved å flytte innholdet ut og legge inn <br> mellom.
+        if len(ps) >= 2:
+            # unngå å lage gigantiske br-vegger; gjør det kun dersom p-ene er "enkle"
+            if any(_has_block_descendants(p) for p in ps):
+                skipped += 1
+                continue
+            # Gjennomfør merge
+            for i, p in enumerate(ps):
+                # flytt innholdet til cellen
+                for n in list(p.contents):
+                    p.insert_before(n.extract())
+                # legg inn <br> mellom avsnitt (ikke etter siste)
+                if i < len(ps) - 1:
+                    p.insert_before(soup.new_tag("br"))
+                p.decompose()
+            _collapse_consecutive_br(cell)
+            merged_multi += 1
+            continue
+
+        # 3) Default: la stå
+        skipped += 1
+
+    logger.info(f"2.10.4 - Done. Unwrapped single <p>: {unwrapped_single}, merged multi-<p>: {merged_multi}, skipped: {skipped}")
 
     # 2.10.5 Lists within tables
     # Already implemented by SMR 2.4
