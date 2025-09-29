@@ -6277,20 +6277,23 @@ def _comment_to_li(soup, box: Tag) -> Tag:
 
 # --- Hjelpere for § 2.8.1 -----------------------------------------------------
 
-# Strengere dialog-cue: "Navn:" eller "Navn –/—/-"
-# NB: Regex alene avgjør ikke — vi validerer navnet i tillegg.
-_SPEAKER_RX = re.compile(r"^\s*([A-ZÆØÅ][\wÆØÅæøå\.\- ]{1,50}?)\s*([:–—-])\s+", flags=re.UNICODE)
+# Dialog-cue: "Navn:" eller "Navn –/—/-" i starten av et avsnitt.
+# NB: Regexen alene avgjør ingenting; vi validerer navnet separat.
+_SPEAKER_RX = re.compile(
+    r"^\s*([A-ZÆØÅ][\wÆØÅæøå\.\- ]{1,50}?)\s*([:–—-])\s+",
+    flags=re.UNICODE
+)
 
-# Ord som IKKE er talernavn i skolebøker (matematikk m.m.)
+# Ord/etiketter som *ikke* er talernavn i skolebøker (inkl. mattevariabler)
 _STOPNAME_TOKENS = {
-    # norsk skolefaglig
+    # skolefaglige
     "oppgave","oppgåve","eksempel","figur","tabell","definisjon","teorem","setning",
     "bevis","hint","løysing","løsning","kapittel","del","side","kommentar","merknad",
-    # typiske variabel-/symbol-etiketter i matte/naturfag
-    "v","a","m","n","x","y","z","f","g","h","u","s","t","r","p","q","k"  # enbokstav
+    # typiske matte-/naturfag-etiketter (enbokstav)
+    "v","a","m","n","x","y","z","f","g","h","u","s","t","r","p","q","k"
 }
 
-# Cues for at en seksjon faktisk er et stykke/manus
+# Cues for seksjoner som faktisk er skuespill/manus
 _PLAY_HEADING_TOKENS = {
     "skuespill","drama","scene","akt","dialog","manus","replikk","roller","personer",
     "dramatis personae","cast","characters","play"
@@ -6298,40 +6301,42 @@ _PLAY_HEADING_TOKENS = {
 
 _HEADING_RX = re.compile(r"^h([1-6])$", re.I)
 
-def _nearest_section(node: Tag, soup):
+# ------------------------------- Hjelpere -------------------------------------
+
+
+'''
+def _nearest_section(node: Tag):
     anc = node
     while anc is not None and getattr(anc, "name", None) != "section":
         anc = anc.parent
     return anc
+'''
 
 def _mark_section_as_play(section: Tag):
+    if not section or section.name != "section":
+        return
     cls = set(section.get("class", []) or [])
     if "play" not in cls:
         cls.add("play")
         section["class"] = sorted(cls)
 
 def _valid_speaker_name(name: str) -> bool:
-    """
-    Streng validering: må se ut som et faktisk navn, ikke 'V', 'Oppgave', 'Figur' osv.,
-    og ikke inneholde tall/likhetstegn/typiske formeltegn.
-    """
+    """Streng validering for å unngå matte/etikett-feller."""
     if not name:
         return False
     n = name.strip().strip(" .-–—").lower()
-    # stoppord og enbokstav
     if n in _STOPNAME_TOKENS:
         return False
     if len(n) <= 1:
         return False
-    # ikke tillat tall/likhetstegn i 'navn'
+    # Ikke tillat tall/likhetstegn/typiske formeltegn i «navn»
     if any(ch.isdigit() for ch in n) or any(ch in "=±×·*/^" for ch in n):
         return False
-    # krever minst én vokal → filtrerer "V:", "mn:", "df:" osv.
-    if not re.search(r"[aeiouyæøå]", n, flags=re.I):
-        return False
-    return True
+    # Krev minst én vokal (filtrerer "V:", "MN:" osv.)
+    return bool(re.search(r"[aeiouyæøå]", n, flags=re.I))
 
 def _is_entirely_italic_p(p: Tag) -> bool:
+    """Hele avsnittet er kursiv (klassisk regianvisning)."""
     if p is None or p.name != "p":
         return False
     content = [c for c in p.contents if not (isinstance(c, NavigableString) and not c.strip())]
@@ -6341,32 +6346,32 @@ def _is_entirely_italic_p(p: Tag) -> bool:
     return isinstance(child, Tag) and child.name in {"em","i"} and not child.find(True)
 
 def _looks_like_stage_direction_text(text: str) -> bool:
+    """Parenteslinje eller kort regiaktig tekst uten dialog-cue."""
     if not text:
         return False
     t = text.strip()
     if len(t) <= 240 and t.startswith("(") and t.endswith(")"):
         return True
-    if len(t) <= 120 and not _SPEAKER_RX.match(t):
+    if len(t) <= 120 and not _SPEAKER_RX.match(t or ""):
         low = t.lower()
         if any(tok in low for tok in ("(","exit","pause","stille","banker","sukker","ser","går","trår","roper")):
             return True
     return False
 
 def _wrap_speaker_span_in_p(soup, p: Tag, match: re.Match) -> bool:
+    """Pakk talerens navn i <span class="speaker">…: </span> (idempotent)."""
     # Ikke rør hvis allerede pakket
     first_el = next((c for c in p.contents if not (isinstance(c, NavigableString) and not c.strip())), None)
     if isinstance(first_el, Tag) and first_el.name == "span" and "speaker" in (first_el.get("class", []) or []):
         return False
 
-    # Sikre at vi opererer på første tekstnode (evt. løft fra enkel inline)
+    # Finn første tekstnode (løft enkel inline om nødvendig)
     first_text_idx = None
     for idx, c in enumerate(p.contents):
-        if isinstance(c, NavigableString):
-            if str(c):
-                first_text_idx = idx; break
-        elif isinstance(c, Tag) and c.name in {"em","strong","b","i","span"} and c.get_text("", strip=False) and not c.find(True):
-            txt = c.get_text("", strip=False)
-            c.replace_with(NavigableString(txt))
+        if isinstance(c, NavigableString) and str(c):
+            first_text_idx = idx; break
+        if isinstance(c, Tag) and c.name in {"em","strong","b","i","span"} and c.get_text("", strip=False) and not c.find(True):
+            c.replace_with(NavigableString(c.get_text("", strip=False)))
             first_text_idx = idx; break
     if first_text_idx is None:
         return False
@@ -6382,11 +6387,10 @@ def _wrap_speaker_span_in_p(soup, p: Tag, match: re.Match) -> bool:
         return False
 
     delim = m.group(2)
-    span = soup.new_tag("span")
-    span["class"] = ["speaker"]
+    span = soup.new_tag("span"); span["class"] = ["speaker"]
     span.append(f"{raw_name}{delim} ")
-
     rest = txt[m.end():]
+
     text_node.replace_with(span)
     if rest:
         span.insert_after(NavigableString(rest))
@@ -6395,10 +6399,10 @@ def _wrap_speaker_span_in_p(soup, p: Tag, match: re.Match) -> bool:
 def _section_has_play_cues(section: Tag) -> bool:
     """
     Krev sterke signaler før vi gjør noe:
-    - eksplisitt class='play' eller epub:type inneholder 'drama'/'play', ELLER
-    - overskrift med play-ord, ELLER
-    - minst 6 replikk-linjer totalt og >=2 ulike, gyldige talernavn (hver minst 2 ganger), ELLER
-    - minst 3 replikk-linjer + minst 2 regilinjer.
+    - eksplisitt class='play' eller epub:type med 'drama'/'play', ELLER
+    - heading med play-ord, ELLER
+    - >=6 replikk-linjer og >=2 ulike talernavn, ELLER
+    - >=3 replikk-linjer + >=2 regilinjer.
     """
     if not section or section.name != "section":
         return False
@@ -6410,11 +6414,11 @@ def _section_has_play_cues(section: Tag) -> bool:
         return True
 
     # Heading-cue
-    head = None
+    head_text = None
     for child in section.find_all(_HEADING_RX, recursive=False):
-        head = child.get_text(" ", strip=True).lower()
+        head_text = child.get_text(" ", strip=True).lower()
         break
-    if head and any(tok in head for tok in _PLAY_HEADING_TOKENS):
+    if head_text and any(tok in head_text for tok in _PLAY_HEADING_TOKENS):
         return True
 
     # Statistikk i seksjonen
@@ -6428,16 +6432,230 @@ def _section_has_play_cues(section: Tag) -> bool:
             speaker_lines += 1
             key = m.group(1).strip().lower()
             name_counts[key] = name_counts.get(key, 0) + 1
-        elif _is_entirely_italic_p(p) or _looks_like_stage_direction_text(t):
+        elif "directions" in (p.get("class", []) or []):
+            stage_dirs += 1
+        elif _is_entirely_italic_p(p) or _looks_like_stage_direction_text(t or ""):
             stage_dirs += 1
 
-    distinct_names = sum(1 for k, c in name_counts.items() if c >= 2)
-
+    distinct_names = sum(1 for _n, c in name_counts.items() if c >= 1)
     if speaker_lines >= 6 and distinct_names >= 2:
         return True
     if speaker_lines >= 3 and stage_dirs >= 2:
         return True
     return False
+
+# ----------------------------- Cleanup-pass -----------------------------------
+
+def cleanup_false_play_markup(soup, logger):
+    """
+    Rydd opp falske positiver fra tidligere kjøringer:
+    - Avpakk gale <span class="speaker">…</span> (bevar råtekst).
+    - Fjern 'directions' fra vanlige avsnitt.
+    - Demoter/fjern 'class="play"' der seksjonen ikke har genuine drama-cues.
+    - Fjern auto-lagde play-seksjoner (data-auto-play="true") uten drama-cues.
+    """
+    fixed = removed_play = 0
+
+    # 1) Avpakk gale 'speaker'
+    for span in list(soup.find_all("span", class_="speaker")):
+        raw = (span.get_text("", strip=False) or "")
+        name = raw.rstrip(":–—- ").strip()
+        if not _valid_speaker_name(name):
+            span.replace_with(NavigableString(raw))
+            fixed += 1
+
+    # 2) Fjern gale 'directions'
+    for p in list(soup.find_all("p", class_=lambda cs: cs and "directions" in cs)):
+        txt = p.get_text("", strip=False) or ""
+        if not _is_entirely_italic_p(p) and not _looks_like_stage_direction_text(txt):
+            classes = set(p.get("class", []) or [])
+            classes.discard("directions")
+            if classes:
+                p["class"] = sorted(classes)
+            elif "class" in p.attrs:
+                del p["class"]
+            fixed += 1
+
+    # 3) Demoter seksjoner med class="play" uten solide cues
+    def _section_has_real_drama(sec: Tag) -> bool:
+        speakers = 0; names = {}; dirs = 0
+        for p in sec.find_all("p"):
+            t = p.get_text("", strip=False) or ""
+            m = _SPEAKER_RX.match(t)
+            if m and _valid_speaker_name(m.group(1)):
+                speakers += 1
+                key = m.group(1).strip().lower()
+                names[key] = names.get(key, 0) + 1
+            elif "directions" in (p.get("class", []) or []):
+                dirs += 1
+            elif _is_entirely_italic_p(p) or _looks_like_stage_direction_text(t):
+                dirs += 1
+        distinct = sum(1 for _n, c in names.items() if c >= 1)
+        return (speakers >= 3 and distinct >= 2) or (speakers >= 2 and dirs >= 2)
+
+    for sec in list(soup.find_all("section", class_="play")):
+        if not _section_has_real_drama(sec):
+            cls = set(sec.get("class", []) or [])
+            if "play" in cls:
+                cls.remove("play")
+                if cls:
+                    sec["class"] = sorted(cls)
+                else:
+                    if "class" in sec.attrs:
+                        del sec["class"]
+                removed_play += 1
+
+        # Fjern auto-play-seksjon hvis den likevel ikke er drama
+        if sec.get("data-auto-play") == "true" and not _section_has_real_drama(sec):
+            for child in list(sec.contents):
+                sec.insert_before(child.extract())
+            sec.decompose()
+            removed_play += 1
+
+    logger.info("Cleanup §2.8.1: unwrapped_speaker/directions=%d, demoted/removed_play=%d",
+                fixed, removed_play)
+    return soup
+
+# --- Hjelpere for § 2.9 -----------------------------------------------------
+
+_BLOCK_TAGS = {
+    # vanlige blokknivå-elementer
+    "address","article","aside","blockquote","canvas","dd","div","dl","dt",
+    "fieldset","figcaption","figure","footer","form","h1","h2","h3","h4",
+    "h5","h6","header","hr","li","main","nav","noscript","ol","p","pre",
+    "section","table","tfoot","ul","video"
+}
+# OBS: <body> og <html> håndteres som blokknivå i praksis
+def _is_block(tag: Tag) -> bool:
+    if not getattr(tag, "name", None):
+        return False
+    n = tag.name.lower()
+    return n in _BLOCK_TAGS or n in {"body","html"}
+
+def _is_pagebreak(tag: Tag) -> bool:
+    if not isinstance(tag, Tag):
+        return False
+    t = (tag.get("epub:type") or "").lower()
+    r = (tag.get("role") or "").lower()
+    return ("pagebreak" in t) or (r == "doc-pagebreak")
+
+def _ensure_unique_id(soup, base_id: str) -> str:
+    """Gjør id unik ved å suffikse -2, -3, ... om nødvendig."""
+    if not base_id:
+        return base_id
+    if soup.find(id=base_id) is None:
+        return base_id
+    # base_id finnes allerede – finn neste ledige
+    i = 2
+    while soup.find(id=f"{base_id}-{i}") is not None:
+        i += 1
+    return f"{base_id}-{i}"
+
+def _normalize_pagebreak_tag(pb: Tag):
+    """Tving pagebreak til div + riktige attributter; fjern innhold."""
+    # alltid <div>
+    pb.name = "div"
+    # epub:type skal inneholde pagebreak (bevar ev. andre tokens)
+    et = (pb.get("epub:type") or "").strip()
+    tokens = set(et.split()) if et else set()
+    tokens.add("pagebreak")
+    pb["epub:type"] = " ".join(sorted(tokens))
+    # role
+    if pb.get("role") != "doc-pagebreak":
+        pb["role"] = "doc-pagebreak"
+    # tomt innhold
+    for c in list(pb.contents):
+        c.extract()
+
+def _label_from_existing(pb: Tag) -> str | None:
+    return pb.get("aria-label") or pb.get("title")
+
+def _maybe_set_label_from_id(pb: Tag):
+    """Hvis ingen aria-label/title, og id inneholder tall, bruk det som aria-label."""
+    if _label_from_existing(pb):
+        return
+    pid = pb.get("id") or ""
+    m = re.search(r"\d+", pid)
+    if m:
+        pb["aria-label"] = m.group(0)
+
+def _move_pagebreak_out_of_p(soup, pb: Tag) -> bool:
+    """
+    Når pagebreak ligger inne i <p>:
+    - Del <p> i 'før' og 'etter'.
+    - Behold 'før' i eksisterende <p>, sett pagebreak etter <p>,
+      og opprett et nytt <p> for 'etter' (om nødvendig).
+    """
+    p = pb.parent
+    if not (p and getattr(p, "name", "").lower() == "p"):
+        return False
+
+    # Del opp innholdet i p i noder før/etter pb
+    before_nodes, after_nodes = [], []
+    in_after = False
+    for node in list(p.contents):
+        if node is pb:
+            in_after = True
+            continue
+        (after_nodes if in_after else before_nodes).append(node)
+
+    # Tøm <p> og fyll tilbake 'før'-noder
+    p.clear()
+    for n in before_nodes:
+        # n er allerede løsrevet etter clear(); bare legg det inn
+        p.append(n)
+
+    # Trekk pb ut og sett mellom 'før' og 'etter'
+    pb.extract()
+    p.insert_after(pb)
+
+    # Lag nytt <p> med 'etter'-noder hvis det er innhold
+    has_after_content = any(
+        (isinstance(n, Tag) and (n.name or n.find(True) or n.get_text("", strip=True))) or
+        (isinstance(n, NavigableString) and str(n).strip())
+        for n in after_nodes
+    )
+    if has_after_content:
+        new_p = soup.new_tag("p")
+        for n in after_nodes:
+            new_p.append(n)
+        pb.insert_after(new_p)
+
+    # Hvis 'før' er helt tomt (pb sto først), fjern tomt <p>
+    if not p.find(True) and not p.get_text("", strip=True):
+        p.decompose()
+
+    return True
+
+def _move_pagebreak_to_block_level(pb: Tag):
+    """
+    Hvis parent er inline (ikke-block), flytt pagebreak opp til nærmeste blokknivå
+    ved å plassere den rett etter den laveste inline-forfaderen.
+    """
+    parent = pb.parent
+    if not parent:
+        return
+    # Hvis allerede direkte under en block, er det ok (unntatt <p> som håndteres separat)
+    if _is_block(parent) and parent.name.lower() != "p":
+        return
+
+    # Finn nærmeste forfader som er block
+    inline_ancestor = pb
+    block_ancestor = parent
+    while block_ancestor and not _is_block(block_ancestor):
+        inline_ancestor = block_ancestor
+        block_ancestor = block_ancestor.parent
+
+    # Ekstrakt pb og legg inn *etter* inline_ancestor på block-nivå
+    pb.extract()
+    # Hvis vi ikke fant block_ancestor, bare append til body/html
+    if not block_ancestor:
+        # nødløsning: bare plasser etter inline_ancestor i dets parent
+        inline_ancestor.insert_after(pb)
+        return
+
+    # Sett inn etter inline_ancestor (bevarer relativ posisjon best mulig)
+    inline_ancestor.insert_after(pb)
 
 # =============== APPLY REQUIREMENTS ================
 
@@ -11005,71 +11223,118 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     # 2.8.1 Plays and screenplays
     # TODO: find formatting. Make interactive
     """
-    Streng og trygg implementasjon for bøker som faktisk er skuespill/manus.
-    Deaktiveres automatisk for matem./realfag og når vi ikke finner solide cues.
+    § 2.8.1 Plays/screenplays — KJØRES KUN NÅR DU BER OM DET (--plays).
+    - Hopper alltid over matematikk- og realfagsbøker.
+    - Behandler bare seksjoner med sterke 'play'-cues.
+    - Idempotent (rører ikke korrekt eksisterende mark-up).
     """
     logger.info("2.8.1 - Plays and screenplays")
 
-    # 0) Aldri i matematikk-/realfags-bøker
+    # Aldri i matte/realfag
     if getattr(args, "mathematics", False) or getattr(args, "science", False):
-        logger.info("2.8.1 - Skipping: mathematics/science book detected.")
-        return soup
+        logger.info("2.8.1 - Skipping: mathematics/science book.")
 
-    # 1) Finn seksjoner som sannsynligvis er skuespill
-    candidates = []
-    for sec in soup.find_all("section"):
-        if _section_has_play_cues(sec):
-            candidates.append(sec)
+    # Kun når skrudd på eksplisitt
+    elif not getattr(args, "plays", False):
+        logger.info("2.8.1 - Skipping: --plays not set.")
 
-    if not candidates:
-        logger.info("2.8.1 - No convincing play cues found; skipping.")
-        return soup
+    else:
+        # Finn sannsynlige drama-seksjoner
+        candidates = [sec for sec in soup.find_all("section") if _section_has_play_cues(sec)]
+        if not candidates:
+            logger.info("2.8.1 - No convincing play cues found; skipping.")
+        else:
+            speaker_lines = directions = sections_marked = 0
 
-    speaker_lines = 0
-    directions = 0
-    sections_marked = 0
+            for sec in candidates:
+                before = set(sec.get("class", []) or [])
+                _mark_section_as_play(sec)
+                after = set(sec.get("class", []) or [])
+                if after != before:
+                    sections_marked += 1
 
-    for sec in candidates:
-        # merk seksjonen som play (idempotent)
-        before = set(sec.get("class", []) or [])
-        _mark_section_as_play(sec)
-        after = set(sec.get("class", []) or [])
-        if after != before:
-            sections_marked += 1
+                for p in sec.find_all("p"):
+                    # hopp over allerede markerte
+                    if p.find("span", class_="speaker"):
+                        continue
+                    if "directions" in (p.get("class", []) or []):
+                        continue
 
-        for p in sec.find_all("p"):
-            # hopp over allerede markerte
-            if p.find("span", class_="speaker"):
-                continue
-            if "directions" in (p.get("class", []) or []):
-                continue
+                    raw = p.get_text("", strip=False) or ""
+                    m = _SPEAKER_RX.match(raw)
+                    if m and _valid_speaker_name(m.group(1)):
+                        if _wrap_speaker_span_in_p(soup, p, m):
+                            speaker_lines += 1
+                        continue
 
-            raw = p.get_text("", strip=False) or ""
-            m = _SPEAKER_RX.match(raw)
-            if m and _valid_speaker_name(m.group(1)):
-                if _wrap_speaker_span_in_p(soup, p, m):
-                    speaker_lines += 1
-                continue
+                    if _is_entirely_italic_p(p) or _looks_like_stage_direction_text(raw):
+                        classes = set(p.get("class", []) or [])
+                        if "directions" not in classes:
+                            classes.add("directions")
+                            p["class"] = sorted(classes)
+                            directions += 1
 
-            if _is_entirely_italic_p(p) or _looks_like_stage_direction_text(raw):
-                cls = set(p.get("class", []) or [])
-                if "directions" not in cls:
-                    cls.add("directions")
-                    p["class"] = sorted(cls)
-                    directions += 1
-
-    logger.info("2.8.1 - Done. speaker_lines=%d, directions=%d, sections_marked=%d",
-                speaker_lines, directions, sections_marked)
+            logger.info("2.8.1 - Done. speaker_lines=%d, directions=%d, sections_marked=%d",
+                        speaker_lines, directions, sections_marked)
 
     # 2.9 Page breaks
-    logger.info('2.9 - Page breaks')
-    pagebreaks = (list(soup('span', attrs={'epub:type':'pagebreak'})) + 
-                  list(soup('span', attrs={'role':'doc-pagebreak'})))
-    for pagebreak in pagebreaks: 
-        for parent in pagebreak.parents:
-            if not parent.name in BLOCK_ELEMENTS: 
-                pagebreak.name          = 'div'
-                pagebreak['epub:type']  = 'pagebreak'
+    """
+    2.9 Page breaks
+    - Normaliser alle pagebreaks til <div epub:type="pagebreak" role="doc-pagebreak">.
+    - Flytt fra inline/p til blokknivå der mulig (splitter <p> rent).
+    - Idempotent; bevarer id/label; lager unik id ved kollisjon.
+    """
+    logger.info("2.9 - Page breaks")
+
+    # Finn alle potensielle pagebreaks: <span>/<div>/<a>/... med epub:type eller role
+    candidates = [el for el in soup.find_all(True) if _is_pagebreak(el)]
+    if not candidates:
+        logger.info("2.9 - No pagebreaks found.")
+    else:
+        # For å kunne sikre unike id-er må vi kjenne eksisterende id'er
+        existing_ids = set()
+        for t in soup.find_all(True):
+            _id = t.get("id")
+            if _id:
+                existing_ids.add(_id)
+
+        converted = moved_p = moved_inline = labeled = 0
+
+        for pb in candidates:
+            # Sikre riktig tag/attribs og tomt innhold
+            _normalize_pagebreak_tag(pb)
+            converted += 1
+
+            # Unik id om nødvendig (bare hvis pb har id)
+            pid = pb.get("id")
+            if pid:
+                new_id = pid
+                if pid in existing_ids and soup.find(id=pid) is not pb:
+                    new_id = _ensure_unique_id(soup, pid)
+                    pb["id"] = new_id
+                existing_ids.add(new_id)
+
+            # Sett label fra id hvis mangler
+            before_label = _label_from_existing(pb)
+            _maybe_set_label_from_id(pb)
+            if not before_label and _label_from_existing(pb):
+                labeled += 1
+
+            # Flytt ut av <p> først
+            if pb.parent and pb.parent.name and pb.parent.name.lower() == "p":
+                if _move_pagebreak_out_of_p(soup, pb):  # <— passér soup inn her
+                    moved_p += 1
+                    continue
+
+            # Hvis parent fortsatt ikke er block → flytt til blokknivå
+            if pb.parent and not _is_block(pb.parent):
+                _move_pagebreak_to_block_level(pb)
+                moved_inline += 1
+
+        logger.info(
+            "2.9 - Done. normalized=%d, moved_out_of_p=%d, moved_from_inline=%d, labeled_from_id=%d",
+            converted, moved_p, moved_inline, labeled
+        )
 
     # 2.9.1 Relocation of page breaks
     logger.info('2.9.1 - Relocation of page breaks')
@@ -11513,6 +11778,14 @@ def main():
                         help='Convert tables (§2.5.1.18) more aggressively',
                         action='store_true',
                         default=False)
+    parser.add_argument('--plays',
+                        dest='plays',
+                        help='Apply §2.8.1 (plays/screenplays) transforms. Default OFF.',
+                        action='store_true')
+    parser.add_argument('--cleanup-plays',
+                        dest='cleanup_plays',
+                        help='Cleanup false play markup (remove wrong class="play", bogus speaker/directions).',
+                        action='store_true')
 
     args = parser.parse_args()
     configure_logging(args.verbose)
