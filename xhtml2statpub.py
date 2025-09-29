@@ -4950,6 +4950,141 @@ def _in_task_or_key_ancestor(node):
         p = getattr(p, "parent", None)
     return False
 
+# --- Hjelpere for 2.5.1.13 ----------------------------------------------------
+_NUM_PREFIX_RX = re.compile(r"^\s*(\d+)[\.\):]?\s*(.*)$")
+
+BOARD_CLASS_HINTS = {"boardgame", "board-game", "gameboard", "game-board"}
+BOX_CLASS_HINTS   = {"box", "tile", "square", "space", "cell"}
+
+TASKISH_TOKENS = {
+    "assessment","assessments",
+    "exercise","exercises",
+    "practice","task","tasks",
+    "question","questions",
+    "answer","answers","key","fasit"
+}
+
+def _epub_types(el: Tag) -> set[str]:
+    t = (el.get("epub:type") or "").lower()
+    return set(t.split()) if t else set()
+
+def _is_task_container(el: Tag) -> bool:
+    if not getattr(el, "name", None): return False
+    cls = set(el.get("class", []) or [])
+    if "task" in cls or "key" in cls: return True
+    return bool(_epub_types(el) & TASKISH_TOKENS)
+
+def _in_task_ancestor(node: Tag) -> bool:
+    p = node
+    while p is not None:
+        if _is_task_container(p): return True
+        p = getattr(p, "parent", None)
+    return False
+
+def _text(node) -> str:
+    if node is None: return ""
+    if isinstance(node, NavigableString): return str(node)
+    return node.get_text(" ", strip=True) or ""
+
+def _parse_css_px(style: str, prop: str) -> float | None:
+    if not style: return None
+    m = re.search(rf"{prop}\s*:\s*(-?\d+(?:\.\d+)?)px", style, flags=re.I)
+    return float(m.group(1)) if m else None
+
+def _has_generated_board_list(container: Tag) -> Tag | None:
+    # Finn en eksisterende generert liste rett etter containeren
+    sib = container.next_sibling
+    while isinstance(sib, NavigableString) and not sib.strip():
+        sib = sib.next_sibling
+    if isinstance(sib, Tag) and sib.name in {"ol","ul"}:
+        classes = set(sib.get("class", []) or [])
+        if "boardgame-list" in classes:
+            return sib
+    return None
+
+def _mk_list(soup, ordered: bool):
+    if ordered:
+        lst = soup.new_tag("ol")
+    else:
+        lst = soup.new_tag("ul")
+        # unstyled for å unngå ekstra bullets om ønskelig
+        cls = set(lst.get("class", []) or [])
+        cls.add("list-unstyled")
+        lst["class"] = list(cls)
+    # felles klasse for idempotens
+    cls = set(lst.get("class", []) or [])
+    cls.add("boardgame-list")
+    lst["class"] = list(cls)
+    return lst
+
+# --- trekk ut bokser fra ulike kildetyper ------------------------------------
+
+def _extract_table_boxes(table: Tag):
+    """Returner (ok, boxes, meta): boxes = [{'text', 'row', 'col'}]."""
+    rows = table.find_all("tr", recursive=False)
+    if len(rows) < 2: return False, [], {}
+    boxes = []
+    for r_idx, tr in enumerate(rows):
+        cells = tr.find_all(["td","th"], recursive=False)
+        if not cells: continue
+        for c_idx, td in enumerate(cells):
+            txt = _text(td)
+            if not txt: continue
+            # hopp over tydelig dekor (enkelt bindestrek etc.)
+            if txt.strip() in {"-", "—", "–"}: continue
+            boxes.append({"text": txt, "row": r_idx, "col": c_idx})
+    return (len(boxes) >= 6), boxes, {"kind": "table"}
+
+def _extract_abspos_boxes(container: Tag):
+    """Se etter elementer med position:absolute; top/left og tekst."""
+    boxes = []
+    for el in container.find_all(True):
+        if not getattr(el, "name", None): continue
+        style = (el.get("style") or "").lower()
+        if "position:absolute" not in style: continue
+        top  = _parse_css_px(style, "top")
+        left = _parse_css_px(style, "left")
+        if top is None or left is None: continue
+        txt = _text(el)
+        if not txt: continue
+        # filtrer bort veldig korte symboler som ofte er pynt (men behold tall/bokstaver)
+        if len(txt.strip()) == 1 and not txt.strip().isalnum():
+            continue
+        boxes.append({"text": txt, "top": top, "left": left})
+    return (len(boxes) >= 6), boxes, {"kind": "abspos"}
+
+def _extract_class_boxes(container: Tag):
+    """Se etter 'box/tile/square/space'-klasser."""
+    boxes = []
+    for el in container.find_all(True):
+        cls = set(el.get("class", []) or [])
+        if not (cls & BOX_CLASS_HINTS): continue
+        txt = _text(el)
+        if not txt: continue
+        boxes.append({"text": txt})
+    return (len(boxes) >= 6), boxes, {"kind": "class"}
+
+# --- sortering / ordensregler -------------------------------------------------
+
+def _ordered_by_leading_number(items: list[dict]) -> tuple[bool, list[tuple[int,str]]]:
+    out = []
+    for it in items:
+        m = _NUM_PREFIX_RX.match(it["text"])
+        if not m: return False, []
+        num = int(m.group(1))
+        rest = m.group(2).strip()
+        out.append((num, rest if rest else it["text"]))
+    out.sort(key=lambda x: x[0])
+    return True, out
+
+def _by_abspos(items: list[dict]) -> list[str]:
+    items = sorted(items, key=lambda x: (x.get("top", 0.0), x.get("left", 0.0)))
+    return [it["text"] for it in items]
+
+def _by_table_rc(items: list[dict]) -> list[str]:
+    items = sorted(items, key=lambda x: (x.get("row", 0), x.get("col", 0)))
+    return [it["text"] for it in items]
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -8660,6 +8795,119 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
     # 2.5.1.13 Tasks designed as boardgames
     # TODO: check formatting in source
+    """
+    2.5.1.13 Tasks designed as boardgames
+    - Ekstraher tekst fra ruter/bokser og presenter som liste (<ol> eller <ul>).
+    - Rekkefølge: tall 1..N > absolutt posisjon (top/left) > tabell rad/kolonne.
+    - Behold original figur/bilde. Idempotent – bruker class="boardgame-list".
+    """
+    logger.info("2.5.1.13 - Tasks designed as boardgames")
+
+    converted = 0
+    updated   = 0
+    skipped   = 0
+
+    # Finn oppgavekontekster
+    tasks = []
+    for el in soup.find_all(True):
+        if _is_task_container(el):
+            tasks.append(el)
+
+    if not tasks:
+        logger.info("2.5.1.13 - No task containers found.")
+    else:
+        for task in tasks:
+            # Kandidater: figure/div/section som *ser* ut som brettspill
+            candidates = []
+            for cand in task.find_all(["figure","div","section"], recursive=True):
+                classes = set(cand.get("class", []) or [])
+                et = _epub_types(cand)
+                if (classes & BOARD_CLASS_HINTS) or ("boardgame" in et) or ("game" in et and "board" in et):
+                    candidates.append(cand)
+                elif cand.find("table"):
+                    ok, _, _ = _extract_table_boxes(cand.find("table"))
+                    if ok:
+                        candidates.append(cand.find("table"))
+                else:
+                    ok_abs, _, _ = _extract_abspos_boxes(cand)
+                    if ok_abs:
+                        candidates.append(cand)
+
+            # Fallback: finnes det en <figure> med mange små “bokser” inni?
+            if not candidates:
+                for fig in task.find_all("figure"):
+                    ok_cls, _, _ = _extract_class_boxes(fig)
+                    ok_abs, _, _ = _extract_abspos_boxes(fig)
+                    if ok_cls or ok_abs:
+                        candidates.append(fig)
+
+            if not candidates:
+                skipped += 1
+                continue
+
+            for cand in candidates:
+                # Sjekk idempotens – har vi allerede skrevet ut en liste like etter?
+                existing = _has_generated_board_list(cand)
+
+                # Hent ut bokser
+                ok, boxes, meta = False, [], {}
+                if cand.name == "table":
+                    ok, boxes, meta = _extract_table_boxes(cand)
+                else:
+                    ok_abs, boxes_abs, meta_abs = _extract_abspos_boxes(cand)
+                    if ok_abs:
+                        ok, boxes, meta = ok_abs, boxes_abs, meta_abs
+                    else:
+                        ok_cls, boxes_cls, meta_cls = _extract_class_boxes(cand)
+                        if ok_cls:
+                            ok, boxes, meta = ok_cls, boxes_cls, meta_cls
+
+                if not ok or not boxes:
+                    skipped += 1
+                    continue
+
+                # Rekkefølge
+                ordered = False
+                items_text: list[str] = []
+
+                ok_num, numbered = _ordered_by_leading_number(boxes)
+                if ok_num:
+                    ordered = True
+                    items_text = [txt for (_, txt) in numbered]
+                    list_is_ordered = True
+                    use_ol = True
+                elif meta.get("kind") == "abspos":
+                    items_text = _by_abspos(boxes)
+                    use_ol = False
+                elif meta.get("kind") == "table":
+                    items_text = _by_table_rc(boxes)
+                    use_ol = False
+                else:
+                    # siste utvei: behold innsamlet rekkefølge
+                    items_text = [b["text"] for b in boxes]
+                    use_ol = False
+
+                # Rens tekst litt
+                cleaned = []
+                for t in items_text:
+                    t = re.sub(r"\s+", " ", t).strip()
+                    cleaned.append(t)
+
+                # Lag/oppdater liste
+                new_list = _mk_list(soup, ordered=use_ol)
+                for t in cleaned:
+                    li = soup.new_tag("li")
+                    li.append(NavigableString(t))
+                    new_list.append(li)
+
+                if existing is not None:
+                    existing.replace_with(new_list)
+                    updated += 1
+                else:
+                    cand.insert_after(new_list)
+                    converted += 1
+
+        logger.info("2.5.1.13 - Done. converted=%d, updated=%d, skipped=%d", converted, updated, skipped)
 
     # 2.5.1.14 Unformatted lists without bullets within tasks <ul class=”list-unstyled”>
     logger.info('2.5.1.14 Unformatted lists without bullets within tasks <ul class=”list-unstyled”>')
