@@ -5085,6 +5085,89 @@ def _by_table_rc(items: list[dict]) -> list[str]:
     items = sorted(items, key=lambda x: (x.get("row", 0), x.get("col", 0)))
     return [it["text"] for it in items]
 
+# --- Hjelpere for 2.5.1.14 ----------------------------------------------------
+
+_TASKISH_TOKENS = {
+    "assessment","assessments",
+    "exercise","exercises",
+    "practice","task","tasks",
+    "question","questions",
+    "answer","answers","key","fasit"
+}
+
+_BLOCK_TAGS = {
+    "address","article","aside","blockquote","caption","center","div","dl","dt","dd","figure","figcaption",
+    "footer","form","h1","h2","h3","h4","h5","h6","header","hr","li","main","nav","ol","p","pre","section",
+    "table","tbody","thead","tfoot","tr","td","th","ul","video","audio","canvas","math"
+}
+
+def _epub_types(el: Tag) -> set[str]:
+    t = (el.get("epub:type") or "").lower()
+    return set(t.split()) if t else set()
+
+def _is_task_container(el: Tag) -> bool:
+    if not getattr(el, "name", None):
+        return False
+    cls = set(el.get("class", []) or [])
+    if "task" in cls or "key" in cls:
+        return True
+    return bool(_epub_types(el) & _TASKISH_TOKENS)
+
+def _is_inline_only_p(p: Tag) -> bool:
+    # p skal kun inneholde inline; tillat <span>/<a>/<em>/<strong>/<img>/<br>/<code> osv.
+    for d in p.descendants:
+        if isinstance(d, Tag) and d.name in _BLOCK_TAGS and d is not p:
+            return False
+    return True
+
+def _is_bridgehead(p: Tag) -> bool:
+    et = (p.get("epub:type") or "").lower()
+    if "bridgehead" in et:
+        return True
+    # noen ganger brukes <p class="bridgehead">
+    cls = " ".join(p.get("class", [])).lower()
+    return "bridgehead" in cls
+
+def _looks_like_list_p(p: Tag) -> bool:
+    # p med rent inline-innhold regnes som kandidat
+    if not _is_inline_only_p(p):
+        return False
+    # ikke headings/bridgeheads
+    if _is_bridgehead(p):
+        return False
+    # ikke allerede inni <li>
+    anc = p.parent
+    while anc is not None:
+        if getattr(anc, "name", "") in {"li","ul","ol"}:
+            return False
+        anc = anc.parent
+    # ellers OK
+    return True
+
+def _normalize_unstyled_ul(ul: Tag) -> bool:
+    """Sett class=list-unstyled for kuleløse UL-er; fjern list-style-type:none; idempotent."""
+    changed = False
+    style = (ul.get("style") or "").lower().replace(" ", "")
+    cls = set(ul.get("class", []) or [])
+    # sterke indikatorer på kuleløs liste
+    if "list-unstyled" in cls or "plain" in cls or "list-style-type-none" in cls or "list-style-type:none;" in style:
+        if "list-unstyled" not in cls:
+            cls.add("list-unstyled"); ul["class"] = list(cls); changed = True
+        # fjern eksplisitt style hvis den kun var for bullets
+        if "style" in ul.attrs and "list-style-type" in ul["style"].lower():
+            new_style = re.sub(r"(?:^|;)\s*list-style-type\s*:\s*none\s*;?", "", ul["style"], flags=re.I).strip()
+            if new_style:
+                ul["style"] = new_style
+            else:
+                del ul["style"]
+            changed = True
+    return changed
+
+def _mk_ul_unstyled(soup):
+    ul = soup.new_tag("ul")
+    ul["class"] = ["list-unstyled", "generated-unstyled"]
+    return ul
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -8910,11 +8993,92 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         logger.info("2.5.1.13 - Done. converted=%d, updated=%d, skipped=%d", converted, updated, skipped)
 
     # 2.5.1.14 Unformatted lists without bullets within tasks <ul class=”list-unstyled”>
-    logger.info('2.5.1.14 Unformatted lists without bullets within tasks <ul class=”list-unstyled”>')
-    for task in soup(attrs={'epub:type':ASSESSMENTS}):
-        for ul in task('ul'):
-            ul['class'] = 'list-unstyled'
-        # TODO: check consecutive <p> elements and convert to <ul>
+    """
+    2.5.1.14 Unformatted lists without bullets within tasks
+    - Normaliser eksisterende kuleløse <ul> i oppgaver → class="list-unstyled".
+    - Konverter sekvenser av <p> (≥3, inline-only) til <ul class="list-unstyled"> med <li>-elementer.
+    - Idempotent: bruker 'generated-unstyled' for å unngå re-konvertering.
+    """
+    logger.info('2.5.1.14 - Unformatted lists without bullets within tasks')
+
+    tasks = [el for el in soup.find_all(True) if _is_task_container(el)]
+    if not tasks:
+        logger.info("2.5.1.14 - No task containers found.")
+    else:
+        normalized_uls = 0
+        converted_runs = 0
+
+        for task in tasks:
+            # 1) Normaliser eksisterende UL-er
+            for ul in task.find_all("ul"):
+                if _normalize_unstyled_ul(ul):
+                    normalized_uls += 1
+
+            # 2) Finn sekvenser av <p> som bør konverteres til ul.list-unstyled
+            #    Vi vurderer bare direkte barn eller flate løp for å unngå å ødelegge struktur.
+            children = [c for c in task.children if isinstance(c, (Tag, NavigableString))]
+            i = 0
+            while i < len(children):
+                # hopp whitespace-noder
+                if isinstance(children[i], NavigableString) and not children[i].strip():
+                    i += 1
+                    continue
+                # start på <p>-run?
+                if isinstance(children[i], Tag) and children[i].name == "p" and _looks_like_list_p(children[i]):
+                    run = [children[i]]
+                    j = i + 1
+                    while j < len(children):
+                        c = children[j]
+                        if isinstance(c, NavigableString) and not c.strip():
+                            j += 1
+                            continue
+                        if isinstance(c, Tag) and c.name == "p" and _looks_like_list_p(c):
+                            run.append(c); j += 1; continue
+                        break
+
+                    # Vurder konvertering: minst 3 <p> i run og det finnes ikke allerede en generert liste rett før/etter
+                    if len(run) >= 3:
+                        # idempotens: sjekk om run allerede er representert av ul.generated-unstyled
+                        prev = run[0].previous_sibling
+                        while isinstance(prev, NavigableString) and not prev.strip():
+                            prev = prev.previous_sibling
+                        if isinstance(prev, Tag) and prev.name == "ul" and "generated-unstyled" in (prev.get("class", []) or []):
+                            # allerede konvertert tidligere (og flyttet) – hopp
+                            i = j
+                            continue
+
+                        ul = _mk_ul_unstyled(soup)
+                        # Sett inn ul før første p i run
+                        run[0].insert_before(ul)
+
+                        # Flytt innholdet fra p til li (bevar inline-innhold)
+                        for p in run:
+                            li = soup.new_tag("li")
+                            # flytt alle p.children til li
+                            for node in list(p.contents):
+                                li.append(node.extract())
+                            ul.append(li)
+                            # fjern p
+                            p.decompose()
+
+                        converted_runs += 1
+                        # Bygg nye children-list og reposition i
+                        children = [c for c in task.children if isinstance(c, (Tag, NavigableString))]
+                        # sett i til pos etter ul
+                        # finn index av ul i children:
+                        try:
+                            i = children.index(ul) + 1
+                        except ValueError:
+                            i = j
+                        continue
+                    else:
+                        # kort run – ikke konverter
+                        i = j
+                        continue
+                else:
+                    i += 1
+
+        logger.info("2.5.1.14 - Done. normalized_uls=%d, p_runs_converted=%d", normalized_uls, converted_runs)
 
     # 2.5.1.15 Lists of tasks with non-standard numbering
     logger.info('2.5.1.15 Lists of tasks with non-standard numbering')
