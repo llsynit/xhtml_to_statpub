@@ -5344,6 +5344,177 @@ def _insertion_anchor_inside_li(li: Tag):
             return child
     return None
 
+# --- Hjelpere for 2.5.1.17 ----------------------------------------------------
+
+_TASKISH_TOKENS = {
+    "assessment","assessments",
+    "exercise","exercises",
+    "practice","task","tasks",
+    "question","questions",
+    "answer","answers","key","fasit"
+}
+
+_CHECK_GLYPHS = set("☐☑☒✓✔✗✘")
+
+def _epub_types(el: Tag) -> set[str]:
+    t = (el.get("epub:type") or "").lower()
+    return set(t.replace(";", " ").replace(",", " ").split()) if t else set()
+
+def _is_task_container(el: Tag) -> bool:
+    if not getattr(el, "name", None): return False
+    cls = set(el.get("class", []) or [])
+    if "task" in cls or "key" in cls: return True
+    return bool(_epub_types(el) & _TASKISH_TOKENS)
+
+def _text(n) -> str:
+    if n is None: return ""
+    if isinstance(n, NavigableString): return str(n)
+    return n.get_text(" ", strip=True) or ""
+
+def _get_rows(tbl: Tag):
+    return tbl.find_all("tr", recursive=False)
+
+def _get_cells(tr: Tag):
+    return tr.find_all(["td","th"], recursive=False)
+
+def _is_checkboxy_cell(cell: Tag) -> bool:
+    # input[type=checkbox], svg/tegn, "x"/"X" alene, eller img med alt som indikerer checkbox
+    if cell.find(lambda t: getattr(t, "name", "") == "input" and (t.get("type") or "").lower() == "checkbox"):
+        return True
+    if cell.find("svg"):
+        return True
+    txt = _text(cell)
+    if txt and txt.strip() in {"x","X"}:
+        return True
+    if txt and any(ch in _CHECK_GLYPHS for ch in txt):
+        return True
+    img = cell.find("img")
+    if img:
+        alt = (img.get("alt") or "").lower()
+        if any(k in alt for k in ("check","checkbox","tick","kryss","avkryss")):
+            return True
+    return False
+
+def _detect_ticking_table(table: Tag):
+    """
+    Returner (ok, headings:list[str], statements:list[str]).
+    - headings: ord fra 'avkryssings' kolonneoverskrifter (unntatt første tekstkolonne)
+    - statements: tekst i første kolonne (én per rad)
+    """
+    rows = _get_rows(table)
+    if len(rows) < 2:
+        return False, [], []
+
+    # Finn header-rad: prioriter en rad med th-celler øverst
+    header = None
+    if rows and any(c.name == "th" for c in _get_cells(rows[0])):
+        header = rows[0]
+        body_rows = rows[1:]
+    else:
+        # evt. se etter rad med flest th
+        th_candidates = [r for r in rows if any(c.name == "th" for c in _get_cells(r))]
+        if th_candidates:
+            header = th_candidates[0]
+            idx = rows.index(header)
+            body_rows = rows[:idx] + rows[idx+1:]
+        else:
+            # ingen tydelig header → prøv å infere kolonner ved checkbox-kolonner
+            header = None
+            body_rows = rows
+
+    # Bygg kolonne-statistikk for ‘checkboxy’ kolonner
+    if not body_rows:
+        return False, [], []
+
+    num_cols = max(len(_get_cells(r)) for r in body_rows)
+    if num_cols < 2:
+        return False, [], []
+
+    checkbox_col_idx = set()
+    nonempty_counts = [0]*num_cols
+    checkbox_counts = [0]*num_cols
+    row_count = 0
+
+    for r in body_rows:
+        cells = _get_cells(r)
+        if not cells:
+            continue
+        row_count += 1
+        for j, c in enumerate(cells):
+            txt = _text(c)
+            if txt:
+                nonempty_counts[j] += 1
+            if _is_checkboxy_cell(c) or not txt.strip():
+                # tomme celler i avkryssingskolonner er vanlig → regn dem som 'checkboxy'-vennlige
+                checkbox_counts[j] += 1
+
+    # En avkryssingskolonne: over 80% "checkboxy" (tomme, x, glyphs, etc.)
+    for j in range(num_cols):
+        if j == 0:
+            continue
+        if row_count and (checkbox_counts[j] / row_count) >= 0.8:
+            checkbox_col_idx.add(j)
+
+    if not checkbox_col_idx:
+        # hvis vi ikke finner tydelige checkbox-kolonner → ikke behandl som ticking
+        return False, [], []
+
+    # Hent headings fra header-row for checkbox-kolonner (om mulig)
+    headings = []
+    if header:
+        header_cells = _get_cells(header)
+        for j, c in enumerate(header_cells):
+            if j == 0:  # første kolonne er påstands-tekst
+                continue
+            if j in checkbox_col_idx:
+                lbl = _text(c)
+                if lbl:
+                    headings.append(lbl.strip())
+    # Filtrer bort tomme headings
+    headings = [h for h in headings if h]
+
+    # Hent statements fra body (første kolonne)
+    statements = []
+    for r in body_rows:
+        cells = _get_cells(r)
+        if not cells:
+            continue
+        first = cells[0]
+        s = _text(first).strip()
+        if s:
+            statements.append(s)
+
+    # må ha minst 2 statements for at det skal være meningsfullt
+    if len(statements) < 2:
+        return False, [], []
+
+    return True, headings, statements
+
+def _existing_generated_list(after_node: Tag):
+    sib = after_node.next_sibling
+    while isinstance(sib, NavigableString) and not sib.strip():
+        sib = sib.next_sibling
+    if isinstance(sib, Tag) and sib.name in {"ol","ul"}:
+        classes = set(sib.get("class", []) or [])
+        if "ticking-boxes-list" in classes:
+            return sib
+    return None
+
+def _make_heading_p(soup, headings: list[str]):
+    p = soup.new_tag("p")
+    # Slå sammen med " / " (legg inn normalisert mellomrom etter slash)
+    p.string = " / ".join(h.strip() for h in headings if h.strip())
+    return p
+
+def _make_list_from_statements(soup, statements: list[str]):
+    ul = soup.new_tag("ul")
+    ul["class"] = ["list-unstyled", "ticking-boxes-list"]
+    for s in statements:
+        li = soup.new_tag("li")
+        li.append(NavigableString(re.sub(r"\s+", " ", s).strip()))
+        ul.append(li)
+    return ul
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -9411,6 +9582,71 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
     # 2.5.1.17 Tasks with ticking boxes
     # TODO: Check formatting
+    """
+    2.5.1.17 Tasks with ticking boxes
+    - Ikke bruk tabeller. Marker påstandene som liste; overskriftsord fra 'ticking box' i <p> før lista.
+    - Vi detekterer tabeller med (minst én) checkbox-kolonne og tar venstre kolonne som tekst.
+    - Idempotent: erstatter evt. tidligere generert liste (class='ticking-boxes-list').
+    """
+    logger.info("2.5.1.17 - Tasks with ticking boxes")
+
+    tasks = [el for el in soup.find_all(True) if _is_task_container(el)]
+    if not tasks:
+        logger.info("2.5.1.17 - No task containers found.")
+    else:
+        converted = 0
+        updated = 0
+        skipped = 0
+        headings_set = 0
+
+        for task in tasks:
+            # Kandidater: tabeller i task
+            tables = task.find_all("table")
+            for tbl in tables:
+                ok, headings, statements = _detect_ticking_table(tbl)
+                if not ok:
+                    continue
+
+                # Finn evt. eksisterende generert liste
+                existing = _existing_generated_list(tbl)
+
+                # Bygg heading <p> (om vi fant kolonneoverskrifter)
+                p_heading = _make_heading_p(soup, headings) if headings else None
+                ul = _make_list_from_statements(soup, statements)
+
+                if existing is not None:
+                    # erstatt eksisterende liste, og evt. oppdatere heading <p>
+                    # sjekk om forrige node (over eksisterende liste) er en <p> med vår heading
+                    prev = existing.previous_sibling
+                    while isinstance(prev, NavigableString) and not prev.strip():
+                        prev = prev.previous_sibling
+                    replaced_heading = False
+                    if p_heading:
+                        if isinstance(prev, Tag) and prev.name == "p":
+                            prev.replace_with(p_heading); replaced_heading = True; headings_set += 1
+                        else:
+                            tbl.insert_after(p_heading); headings_set += 1
+                            p_heading.insert_after(ul)
+                            existing.decompose()
+                            updated += 1
+                            continue
+                    # hvis vi ikke hadde heading eller vi allerede byttet den ut
+                    existing.replace_with(ul)
+                    updated += 1
+                else:
+                    # Sett inn etter tabellen: først heading <p> (om finnes), så lista
+                    if p_heading:
+                        tbl.insert_after(p_heading)
+                        p_heading.insert_after(ul)
+                        headings_set += 1
+                    else:
+                        tbl.insert_after(ul)
+                    converted += 1
+
+        logger.info(
+            "2.5.1.17 - Done. converted=%d, updated=%d, headings_set=%d, skipped=%d",
+            converted, updated, headings_set, skipped
+        )
 
     # 2.5.1.18 Tasks with tables better represented as lists
     # TODO: make parameter option
