@@ -6068,6 +6068,213 @@ def _normalize_frame_classes(el: Tag):
             classes.add("generisk-ramme")
     el["class"] = sorted(classes)
 
+# --- Hjelpere for 2.7 ----------------------------------------------------
+
+# Stikkord som ofte markerer margkommentarer
+_MARGIN_CLASS_TOKENS = {
+    "margin", "marginalia", "marg", "sidekommentar", "merknad", "kommentar",
+    "comment", "sidebar-note", "note-margin"
+}
+_MARGIN_TYPE_TOKENS = {"annotation", "marginalia", "sidebar", "note", "comment"}
+
+# Oppgave-/fasitmarkører vi vil stoppe før når vi plasserer listen
+_TASKISH_TOKENS = {"assessment","assessments","exercise","exercises","practice","task","tasks"}
+
+_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
+
+def _tokenize_types(val: str) -> set[str]:
+    return set((val or "").lower().replace(";", " ").replace(",", " ").split())
+
+def _epub_types(el: Tag) -> set[str]:
+    return _tokenize_types(el.get("epub:type", ""))
+
+def _is_task_tag(tag: Tag) -> bool:
+    return bool(_epub_types(tag) & _TASKISH_TOKENS)
+
+def _nearest_section(tag: Tag):
+    anc = tag
+    while anc is not None and getattr(anc, "name", None) != "section":
+        anc = anc.parent
+    return anc
+
+def _find_insertion_point_end_of_text(section: Tag):
+    """
+    Returner noden vi skal sette *før* for å lande «på slutten av teksten»,
+    men fortsatt før oppgaver/glossary/relokerte figurer. None = append på slutten.
+    """
+    children = [c for c in section.children if isinstance(c, Tag)]
+    stop_idx = None
+    for i, c in enumerate(children):
+        if _is_task_tag(c):
+            stop_idx = i; break
+        if c.name == "aside" and (
+            "glossary" in (c.get("class", []) or []) or c.get("data-relocated") == "dl-glossary"
+        ):
+            stop_idx = i; break
+        if c.name == "figure" and c.get("data-relocated-figure") == "true":
+            stop_idx = i; break
+    if stop_idx is None:
+        return None
+    return children[stop_idx]
+
+def _is_lightweight(tag: Tag) -> bool:
+    """Heuristikk: korte tekstbokser uten tunge blokkelementer → ofte margkommentarer."""
+    if not tag: return False
+    cls = set(tag.get("class", []) or [])
+    if "prodnote" in cls or "fig-desc" in cls or "glossary" in cls:
+        return False
+    tks = _epub_types(tag)
+    if "z3998:production" in tks:
+        return False
+    if tag.find(["table","dl","figure","section"]):
+        return False
+    txt = tag.get_text(" ", strip=True)
+    return bool(txt) and len(txt) <= 400
+
+def _looks_like_margin_comment(tag: Tag) -> bool:
+    if not isinstance(tag, Tag):
+        return False
+    if tag.get("data-processed") == "margin-comment":
+        return False
+    if tag.name not in {"aside", "div"}:
+        return False
+    cls = {c.lower() for c in (tag.get("class", []) or [])}
+    tks = _epub_types(tag)
+    has_hint = bool(cls & _MARGIN_CLASS_TOKENS) or bool(tks & _MARGIN_TYPE_TOKENS)
+    return has_hint or _is_lightweight(tag)
+
+def _extract_anchor_id_from_comment(tag: Tag | None) -> str | None:
+    """
+    Returner id (uten '#') hvis margkommentaren peker på et mål i teksten.
+    Robust mot None / ikke-Tag / liste-attributter / uventede noder.
+    """
+    # Hard guard
+    if tag is None or not isinstance(tag, Tag):
+        return None
+
+    def _first_str(val):
+        if val is None:
+            return None
+        # Når BeautifulSoup gir lister for enkelte attributter
+        if isinstance(val, (list, tuple)):
+            for x in val:
+                s = str(x).strip()
+                if s:
+                    return s
+            return None
+        return str(val).strip()
+
+    # 1) Direkte koblingsattributter som kan peke på id
+    for attr in ("data-ref", "data-for", "data-target", "aria-describedby"):
+        try:
+            v = _first_str(tag.attrs.get(attr))
+            if v:
+                if v.startswith("#"):
+                    v = v[1:]
+                if v:
+                    return v
+        except Exception:
+            # ignorer uvanlig struktur
+            pass
+
+    # 2) Første <a href="#..."> inne i boksen
+    try:
+        a = tag.find("a", href=True)
+        if a:
+            href = _first_str(a.attrs.get("href"))
+            if href and href.startswith("#"):
+                return href[1:]
+    except Exception:
+        pass
+
+    return None
+
+def _ensure_ul_container(soup, anchor_or_section: Tag) -> Tag:
+    """
+    Finn/lag <ul class="margin-comments list-unstyled"> på riktig sted:
+    - hvis anchor er en konkret node i teksten: sett UL *etter* ankeret,
+    - ellers: helt på slutten av seksjonen, men før tasks/glossary/relokert.
+    """
+    if anchor_or_section is None or not isinstance(anchor_or_section, Tag):
+        parent = getattr(soup, "body", None)
+        if parent is None:
+            ul = soup.new_tag("ul")
+            ul["class"] = ["margin-comments", "list-unstyled"]
+            return ul
+        anchor_or_section = parent
+
+    if getattr(anchor_or_section, "name", None) != "section":
+        # Sett etter anker-node
+        try:
+            nxt = anchor_or_section.next_sibling
+            while isinstance(nxt, NavigableString) and not nxt.strip():
+                nxt = nxt.next_sibling
+            if isinstance(nxt, Tag) and nxt.name == "ul" and "margin-comments" in (nxt.get("class", []) or []):
+                return nxt
+            ul = soup.new_tag("ul")
+            ul["class"] = ["margin-comments", "list-unstyled"]
+            anchor_or_section.insert_after(ul)
+            return ul
+        except Exception:
+            # Fallback: legg i slutten av nærmeste seksjon
+            sec = _nearest_section(anchor_or_section) or soup.body
+            if sec is None:
+                ul = soup.new_tag("ul")
+                ul["class"] = ["margin-comments", "list-unstyled"]
+                return ul
+            ref = _find_insertion_point_end_of_text(sec)
+            ul = soup.new_tag("ul")
+            ul["class"] = ["margin-comments", "list-unstyled"]
+            (sec.append if ref is None else ref.insert_before)(ul)
+            return ul
+
+    # Seksjon: plasser ved end-of-text
+    section = anchor_or_section
+    ref = _find_insertion_point_end_of_text(section)
+
+    # Finn eksisterende UL i end-of-text-sonen
+    candidate = None
+    if ref is None:
+        last = None
+        for c in section.contents[::-1]:
+            if isinstance(c, Tag):
+                last = c; break
+        if last is not None and last.name == "ul" and "margin-comments" in (last.get("class", []) or []):
+            candidate = last
+    else:
+        prev = ref.previous_sibling
+        while isinstance(prev, NavigableString) and not prev.strip():
+            prev = prev.previous_sibling
+        if isinstance(prev, Tag) and prev.name == "ul" and "margin-comments" in (prev.get("class", []) or []):
+            candidate = prev
+
+    if candidate:
+        return candidate
+
+    ul = soup.new_tag("ul")
+    ul["class"] = ["margin-comments", "list-unstyled"]
+    if ref is None:
+        section.append(ul)
+    else:
+        ref.insert_before(ul)
+    return ul
+
+def _comment_to_li(soup, box: Tag) -> Tag:
+    """
+    Konverter en boks til ett <li>. Behold eksisterende <p>-er hvis de finnes,
+    ellers bruk samlet tekst.
+    """
+    li = soup.new_tag("li")
+    ps = box.find_all("p", recursive=False)
+    if ps and any(p.get_text("", strip=True) for p in ps):
+        for p in list(ps):
+            li.append(p.extract())
+    else:
+        txt = box.get_text(" ", strip=True)
+        if txt:
+            li.append(NavigableString(txt))
+    return li
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -10542,6 +10749,92 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
     # 2.7 Comments in the margin
     # TODO: find examples and original markup
+    """
+    2.7 Comments in the margin
+    - Identifiser margkommentarer, samle dem i <ul class="margin-comments list-unstyled">
+      og plasser på slutten av teksten de tilhører (før tasks/glossary/relokert).
+    - Idempotent: fjerner originalboks etter flytting; dedupliserer <li> på tekstinnhold.
+    - LLM (valgfritt): binær klassifisering i tvilstilfeller.
+    """
+    logger.info("2.7 - Comments in the margin")
+
+    # Respekter --no-relocate hvis du bruker det i prosjektet
+    if hasattr(args, "relocate") and not getattr(args, "relocate", True):
+        logger.info("2.7 - Relocation disabled (--no-relocate); skipping.")
+    else:
+        # Valgfri LLM-klient
+        llm = None
+        if use_llm and "._ensure_llm_client" in str(globals().get("_ensure_llm_client", "")):
+            try:
+                llm = _ensure_llm_client(logger, use_llm)
+            except Exception:
+                llm = None
+
+        found = moved = 0
+        candidates = []
+
+        # Finn potensielle margkommentarer
+        for box in soup.find_all(["aside","div"]):
+            if not isinstance(box, Tag):
+                continue
+            if not _looks_like_margin_comment(box):
+                continue
+            # Hopp over ting som ikke skal behandles her
+            if _epub_types(box) & _TASKISH_TOKENS:
+                continue
+            if "glossary" in (box.get("class", []) or []):
+                continue
+            candidates.append(box)
+
+        for box in candidates:
+            # LLM-avgjørelse i tvilstilfeller (valgfritt)
+            if use_llm and llm and getattr(llm, "available", False):
+                try:
+                    resp = llm.classify_margin_comment(html_snippet=str(box)[:2000])
+                    if resp and resp.get("is_margin_comment") is False:
+                        continue
+                except Exception:
+                    pass
+
+            found += 1
+
+            # Finn mål (anker eller seksjon)
+            anchor_id = _extract_anchor_id_from_comment(box)
+            anchor = soup.find(id=anchor_id) if anchor_id else None
+
+            section = _nearest_section(box) or soup.body
+            if section is None:
+                logger.debug("2.7 - No <section>/<body> context for margin comment; skipping one.")
+                continue
+
+            target = anchor if (anchor and isinstance(anchor, Tag)) else section
+
+            # Finn/lag UL
+            ul = _ensure_ul_container(soup, target)
+
+            # Bygg LI og dedupliser
+            li = _comment_to_li(soup, box)
+            li_txt_key = (li.get_text(" ", strip=True) or "").strip()
+
+            duplicate = False
+            if li_txt_key:
+                for old in ul.find_all("li", recursive=False):
+                    if (old.get_text(" ", strip=True) or "").strip() == li_txt_key:
+                        duplicate = True
+                        break
+
+            if not duplicate and li_txt_key:
+                ul.append(li)
+                moved += 1
+
+            # Merk og fjern originalen
+            try:
+                box["data-processed"] = "margin-comment"
+                box.decompose()
+            except Exception:
+                pass
+
+        logger.info("2.7 - Done. candidates=%d, moved=%d", found, moved)
 
     # 2.8 Texts with specific styles
 
