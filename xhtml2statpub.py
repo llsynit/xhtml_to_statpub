@@ -4908,6 +4908,38 @@ def _ensure_figcaption_copied(tbl: Tag, fig: Tag):
             figcap.append(n.extract())
         fig.append(figcap)
 
+# --- Hjelpere for 2.5.1.12 ----------------------------------------------------
+
+TASKISH_TOKENS = {
+    "assessment","assessments",
+    "exercise","exercises",
+    "practice","task","tasks",
+    "question","questions",
+    "answer","answers","key","fasit"
+}
+
+def _epub_types(el):
+    t = (el.get("epub:type") or "").lower()
+    return set(t.split()) if t else set()
+
+def _is_task_container(el):
+    if not getattr(el, "name", None):
+        return False
+    cls = set(el.get("class", []) or [])
+    if "task" in cls or "key" in cls:
+        return True
+    if _epub_types(el) & TASKISH_TOKENS:
+        return True
+    return False
+
+def _in_task_or_key_ancestor(node):
+    p = node
+    while p is not None:
+        if _is_task_container(p):
+            return True
+        p = getattr(p, "parent", None)
+    return False
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -8578,7 +8610,22 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     logger.info("2.5.1.11 - Done. converted=%d, skipped=%d", converted, skipped)
 
     # 2.5.1.12 Tasks with figures
-    # Follows from SMR 2.1.2, SMR 2.3.5 and SMR 2.4.4.2
+    """
+    2.5.1.12 Tasks with figures
+    - Figurer som hører til oppgaver skal stå der de står (ikke flyttes).
+    - Merk slike figurer og fjern evt. tidligere 'data-relocated-figure'.
+    """
+    logger.info("2.5.1.12 - Tasks with figures")
+    protected = cleaned = 0
+    for fig in soup.find_all("figure"):
+        if _in_task_or_key_ancestor(fig):
+            if fig.get("data-fixed-in-task") != "true":
+                fig["data-fixed-in-task"] = "true"
+                protected += 1
+            if fig.has_attr("data-relocated-figure"):
+                del fig["data-relocated-figure"]
+                cleaned += 1
+    logger.info("2.5.1.12 - Done. Protected=%d, cleaned_relocated_flag=%d", protected, cleaned)
 
     # 2.5.1.13 Tasks designed as boardgames
     # TODO: check formatting in source
