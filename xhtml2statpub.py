@@ -5951,6 +5951,123 @@ def _ensure_heading_in_section(sec: Tag, label: str, soup):
     h.string = label
     sec.insert(0, h)
 
+# --- Hjelpere for 2.6 ----------------------------------------------------
+
+# tillatte “ramme”-klasser
+_FRAME_ALLOWED = {"generisk-ramme", "ramme", "bg-red", "bg-blue", "bg-yellow", "bg-gray", "bg-beige"}
+_HEADING_RX    = re.compile(r"^h([1-6])$", re.I)
+
+def _epub_types(el: Tag) -> set[str]:
+    t = (el.get("epub:type") or "").lower()
+    return set(t.replace(";", " ").replace(",", " ").split()) if t else set()
+
+def _nearest_section(node: Tag, soup) -> Tag:
+    anc = node
+    while anc is not None and getattr(anc, "name", None) != "section":
+        anc = anc.parent
+    return anc or (soup.body or soup)
+
+def _first_sig_child(tag: Tag):
+    for c in tag.contents:
+        if isinstance(c, NavigableString) and not c.strip():
+            continue
+        return c
+    return None
+
+def _nearest_heading_level(node: Tag) -> int:
+    """
+    Velg overskriftsnivå relativt til kontekst (én under nærmeste heading).
+    """
+    anc = node
+    while anc is not None:
+        # se etter heading blant forelderens direkte barn FØR node
+        cur = anc.previous_sibling
+        while cur is not None:
+            name = getattr(cur, "name", "") or ""
+            m = _HEADING_RX.match(name)
+            if m:
+                return min(int(m.group(1)) + 1, 6)
+            cur = cur.previous_sibling
+        # se etter heading direkte under anc
+        for child in anc.find_all(_HEADING_RX, recursive=False):
+            m = _HEADING_RX.match(child.name)
+            if m:
+                return min(int(m.group(1)) + 1, 6)
+        anc = anc.parent
+    return 3
+
+def _normalize_frame_classes(el: Tag):
+    classes = set(el.get("class", []) or [])
+    # behold bare gyldige ramme-klasser + andre eksisterende (ikke destruktivt),
+    # men sørg for ramme/generisk-ramme-reglene
+    has_bg = any(c.startswith("bg-") for c in classes)
+    if has_bg:
+        classes.add("ramme")
+        classes.discard("generisk-ramme")
+    else:
+        # hvis ingen ramme-relaterte klasser → sett generisk-ramme
+        if not (classes & {"ramme", "generisk-ramme"}):
+            classes.add("generisk-ramme")
+    el["class"] = sorted(classes)
+
+def _skip_aside(aside: Tag) -> bool:
+    et = (aside.get("epub:type") or "").lower()
+    classes = set(aside.get("class", []) or [])
+    if et == "z3998:production" or "prodnote" in classes or "fig-desc" in classes:
+        return True
+    if "glossary" in classes:
+        return True
+    if aside.find("dl"):  # glossaries håndteres i 2.4.4.x
+        return True
+    return False
+
+# --- Hjelpere for 2.6.1 ----------------------------------------------------
+
+_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
+
+def _skip_math_aside(aside: Tag) -> bool:
+    """Skipp prodnote/fig-desc/glossary/desc-lister som ikke skal konverteres her."""
+    et = (aside.get("epub:type") or "").lower()
+    classes = set(aside.get("class", []) or [])
+    if et == "z3998:production" or "prodnote" in classes or "fig-desc" in classes:
+        return True
+    # Glossaries håndteres i 2.4.4.x
+    if "glossary" in classes or aside.find("dl"):
+        return True
+    return False
+
+def _nearest_heading_level(node: Tag) -> int:
+    # Velg headingnivå relativt til kontekst (én under nærmeste heading), fallback h3
+    anc = node
+    while anc is not None:
+        # se etter heading blant direkte barn før node
+        cur = anc.previous_sibling
+        while cur is not None:
+            name = getattr(cur, "name", "") or ""
+            m = _HEADING_RX.match(name)
+            if m:
+                return min(int(m.group(1)) + 1, 6)
+            cur = cur.previous_sibling
+        # se etter heading direkte under anc
+        for child in anc.find_all(_HEADING_RX, recursive=False):
+            m = _HEADING_RX.match(child.name)
+            if m:
+                return min(int(m.group(1)) + 1, 6)
+        anc = anc.parent
+    return 3
+
+def _normalize_frame_classes(el: Tag):
+    """Sørg for at boksene har riktig rammeklassestruktur."""
+    classes = set(el.get("class", []) or [])
+    has_bg = any(c.startswith("bg-") for c in classes)
+    if has_bg:
+        classes.add("ramme")
+        classes.discard("generisk-ramme")
+    else:
+        if not ({"ramme", "generisk-ramme"} & classes):
+            classes.add("generisk-ramme")
+    el["class"] = sorted(classes)
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -6028,6 +6145,76 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     Path(copy_target_dir).mkdir(parents=True, exist_ok=True)
     copyfile(path.join(folders['static'], 'ebok.css'),
             path.join(copy_target_dir, 'ebok.css'))
+
+    # 2.6.1  - Boxes in mathematics books
+    # Moved here, before 2.6 and before 2.1.2 relocation
+    """
+    2.6.1 Boxes in mathematics books
+    - I mattebøker konverteres reelle <aside>-bokser til <div> (del av hovedtekst).
+    - Hopper over prodnote/fig-desc/glossary/dl.
+    - Normaliserer ramme-klasser; justerer evt. headingnivå.
+    - Idempotent; merker med data-original-tag for sporbarhet.
+    - Tips: Kjør før 2.6 og før 2.1.2-relokering.
+    """
+    logger.info("2.6.1 - Boxes in mathematics books")
+
+    if not getattr(args, "mathematics", False):
+        logger.info("2.6.1 - Not a mathematics book; skipping.")
+    else:
+        llm = _ensure_llm_client(logger, use_llm) if use_llm else None
+
+        converted = kept_aside = heading_adjusted = framed = 0
+
+        for aside in list(soup.find_all("aside")):
+            if _skip_math_aside(aside):
+                kept_aside += 1
+                continue
+
+            # Valgfritt: la LLM si fra om denne spesifikt skal forbli aside (unntak fra hovedregelen)
+            if use_llm and llm and getattr(llm, "available", False):
+                prev_sib = aside.find_previous(lambda t: getattr(t, "name", None) in ("p","div","section"))
+                next_sib = aside.find_next(lambda t: getattr(t, "name", None) in ("p","div","section"))
+                resp = llm.classify_math_box_keep_aside(
+                    html_snippet=str(aside)[:2000],
+                    prev_snip=(prev_sib.get_text(" ", strip=True) if prev_sib else ""),
+                    next_snip=(next_sib.get_text(" ", strip=True) if next_sib else ""),
+                )
+                if bool((resp or {}).get("keep_as_aside", False)):
+                    kept_aside += 1
+                    # men normaliser klasser hvis den likevel er aside:
+                    _normalize_frame_classes(aside)
+                    framed += 1
+                    continue
+
+            # Konverter til <div>, bevar alle attributter og innhold
+            div = soup.new_tag("div")
+            for k, v in list(aside.attrs.items()):
+                div.attrs[k] = v
+            # sporbarhet/idempotens
+            div.attrs["data-original-tag"] = "aside"
+            div.attrs["data-math-box"] = "true"
+
+            for n in list(aside.contents):
+                div.append(n.extract())
+            aside.replace_with(div)
+            converted += 1
+
+            # Headingnivå inne i boksen (nå som <div> i hovedløpet) – valgfritt men nyttig
+            h = div.find(_HEADING_RX)
+            if h:
+                target = f"h{_nearest_heading_level(div)}"
+                if h.name != target:
+                    h.name = target
+                    heading_adjusted += 1
+
+            # Sørg for ramme-klasse
+            _normalize_frame_classes(div)
+            framed += 1
+
+        logger.info(
+            "2.6.1 - Done. converted=%d, kept_aside=%d, headings_adjusted=%d, framed=%d",
+            converted, kept_aside, heading_adjusted, framed
+        )
 
     # 2.1.2 Relocation of elements
     # TODO: This specification is unclear
@@ -10275,14 +10462,73 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     logger.info("2.5.2 - Done. wrapped_task=%d, wrapped_key=%d", wrapped_task, wrapped_key)
 
     # 2.6 Sidebars, text boxes etc.
-    logger.info('2.6 - Sidebars, text boxes etc.')
-    for aside in soup.find_all('aside'):
-        et = (aside.get('epub:type') or '').lower()
-        classes = set(aside.get('class', []))
-        if et == 'z3998:production' or 'prodnote' in classes or 'fig-desc' in classes:
-            continue  # ikke rør prodnote / fig-tekst
-        classes.add('generisk-ramme')
-        aside['class'] = list(classes)
+    """
+    2.6 Sidebars, text boxes etc.
+    - Normaliser nivå/klasse for reelle sidebokser (<aside>), ev. konverter integrerte til <div>.
+    - Idempotent; flytter kun ved behov og respekterer prodnote/fig-desc/glossary.
+    """
+    logger.info("2.6 - Sidebars, text boxes etc.")
+
+    llm = _ensure_llm_client(logger, use_llm) if use_llm else None
+
+    converted_to_div = lifted = heading_adjusted = framed = 0
+
+    for aside in list(soup.find_all("aside")):
+        if _skip_aside(aside):
+            continue
+
+        # (Valgfritt) LLM-vurdering: er dette integrert innhold → skal være <div>?
+        integral = False
+        if use_llm and llm and getattr(llm, "available", False):
+            prev_sib = aside.find_previous(lambda t: getattr(t, "name", None) in ("p", "div", "section"))
+            next_sib = aside.find_next(lambda t: getattr(t, "name", None) in ("p", "div", "section"))
+            resp = llm.classify_aside_integral(
+                html_snippet=str(aside)[:2000],
+                prev_snip=(prev_sib.get_text(" ", strip=True) if prev_sib else ""),
+                next_snip=(next_sib.get_text(" ", strip=True) if next_sib else ""),
+            )
+            integral = bool((resp or {}).get("integral", False))
+
+        box = aside
+        if integral:
+            # Konverter til <div> (integrert innhold)
+            div = soup.new_tag("div")
+            for k, v in list(aside.attrs.items()):
+                div.attrs[k] = v
+            div.attrs["data-original-tag"] = "aside"
+            div.attrs["data-integral"] = "true"
+            for n in list(aside.contents):
+                div.append(n.extract())
+            aside.replace_with(div)
+            box = div
+            converted_to_div += 1
+
+        # Løft boksen til riktig seksjonsnivå (direkte barn av nærmeste <section>)
+        sec = _nearest_section(box, soup)
+        top = box
+        while top.parent is not None and top.parent is not sec:
+            top = top.parent
+        if top is not box:
+            box.extract()
+            top.insert_before(box)
+            lifted += 1
+
+        # Juster overskriftsnivå inni boksen (h[x] → riktig nivå)
+        h = box.find(_HEADING_RX)
+        if h:
+            target = f"h{_nearest_heading_level(box)}"
+            if h.name != target:
+                h.name = target
+                heading_adjusted += 1
+
+        # Sørg for ramme-klasser
+        _normalize_frame_classes(box)
+        framed += 1
+
+    logger.info(
+        "2.6 - Done. converted_to_div=%d, lifted=%d, headings_adjusted=%d, framed=%d",
+        converted_to_div, lifted, heading_adjusted, framed
+    )
 
     # 2.6.1 Boxes in mathematics books
     logger.info('2.6.1 - Boxes in mathematics books')
