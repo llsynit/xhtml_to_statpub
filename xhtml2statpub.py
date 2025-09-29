@@ -7242,6 +7242,187 @@ def _mk_ul(items, cls):
         ul.append(li)
     return ul
 
+# --- Hjelpere for § 2.10.7 -----------------------------------------------------
+
+# --- Hjelpere ---------------------------------------------------------------
+
+def _has_complex_content(tag):
+    # Ikke flate ut hvis tabellen inneholder “komplekst” innhold
+    return bool(tag.find(["math","figure","img","svg","video","audio","object","canvas","iframe","dl","ol","ul"]))
+
+def _cell_text(cell):
+    return (cell.get_text(" ", strip=True) or "").replace("\u00A0", " ").strip()
+
+def _is_numericish(s: str) -> bool:
+    s = s.replace(",", ".")
+    return bool(re.fullmatch(r"[+\-]?\d+(\.\d+)?([/%])?", s))
+
+def _table_dims(table):
+    rows = table.find_all("tr")
+    n_rows = len(rows)
+    n_cols = 0
+    for tr in rows:
+        cells = tr.find_all(["td","th"], recursive=False)
+        n_cols = max(n_cols, len(cells))
+    return n_rows, n_cols
+
+def _row_cells(table):
+    # liste av rader (som lister av celler)
+    out = []
+    for tr in table.find_all("tr"):
+        out.append(tr.find_all(["td","th"], recursive=False))
+    return out
+
+def _row_is_header_like(cells):
+    return all(c.name == "th" for c in cells) and len(cells) > 0
+
+def _header_cells_first_row(table):
+    tr = table.find("tr")
+    if not tr:
+        return []
+    return [c for c in tr.find_all(["th","td"], recursive=False)
+            if c.name == "th" or (c.get("scope") or "").lower() == "col"]
+
+def _has_any_header(table):
+    return bool(table.find("th"))
+
+def _header_names(table):
+    hdr = _header_cells_first_row(table)
+    names = []
+    for c in hdr:
+        t = _cell_text(c)
+        if t:
+            names.append(t)
+    return names
+
+def _caption_text(table):
+    cap = table.find("caption")
+    if cap:
+        return cap.get_text(" ", strip=True)
+    title = table.get("title")
+    if title:
+        return (str(title) or "").strip()
+    return None
+
+def _estimate_layout_table(table):
+    """
+    Konservativ heuristikk for å avgjøre “layout vs data”.
+    - 2–4 kolonner, moderat antall rader
+    - få/enkle <th>
+    - celler med korte tekster
+    - lav andel rene tall
+    - ikke ‘komplekst’ innhold
+    """
+    if _has_complex_content(table):
+        return False, "complex-content"
+
+    n_rows, n_cols = _table_dims(table)
+    if n_cols < 2 or n_cols > 4:
+        return False, "cols-out-of-range"
+    if n_rows > 100:  # ytelses- og nøyaktighetshensyn
+        return False, "too-many-rows"
+
+    rows = _row_cells(table)
+    total_cells = sum(len(r) for r in rows) or 1
+    th_count = len(table.find_all("th"))
+    th_ratio = th_count / total_cells
+
+    texts = []
+    numeric_hits = 0
+    long_hits = 0
+    for r in rows:
+        for c in r:
+            t = _cell_text(c)
+            if t:
+                texts.append(t)
+                if _is_numericish(t):
+                    numeric_hits += 1
+                if len(t) > 40:
+                    long_hits += 1
+
+    text_cells = max(1, len(texts))
+    numeric_ratio = numeric_hits / text_cells
+    long_ratio = long_hits / text_cells
+
+    header_ok = th_ratio <= 0.25
+    numeric_ok = numeric_ratio <= 0.35
+    long_ok = long_ratio <= 0.25
+    size_ok = n_rows <= 25
+
+    score = sum(int(x) for x in (header_ok, numeric_ok, long_ok, size_ok))
+    if score >= 3:
+        return True, "heuristics"
+    return False, "heuristics-fail"
+
+def _llm_agrees_layout(table, llm, logger):
+    # Valgfri støtte for args.llm – kan være None hvis klient ikke finnes
+    if not llm or not getattr(llm, "available", False):
+        return None
+    html_snip = str(table)[:3000]
+    try:
+        resp = llm.classify_table_layout(
+            html_snippet=html_snip,
+            hint="Decide if this HTML table is layout/styling-only or genuine data."
+        )
+        return bool(resp.get("layout", False))
+    except Exception as e:
+        logger.debug(f"2.10.7 - LLM classification failed: {e}")
+        return None
+
+def _make_ul_from_table(table, soup, use_headers=True):
+    """
+    Lager <ul class="list-unstyled table-as-list" data-2107="true">.
+    - Hvis første rad er header → “Header: verdi; Header2: verdi2 …”
+    - Ellers: “verdi1; verdi2; …”
+    - Filtrerer tomme celler for å unngå ‘;;’
+    """
+    rows = _row_cells(table)
+    if not rows:
+        return None
+
+    hdr_names = _header_names(table) if use_headers else []
+    start_idx = 1 if rows and _row_is_header_like(rows[0]) else 0
+
+    ul = soup.new_tag("ul")
+    ul["class"] = ["list-unstyled", "table-as-list"]
+    ul["data-2107"] = "true"
+
+    for ri in range(start_idx, len(rows)):
+        cells = rows[ri]
+        vals = [_cell_text(c) for c in cells]
+        # Filtrér bort tomme verdier før vi bygger LI
+        vals = [v for v in vals if v]
+
+        if not vals:
+            continue
+
+        li = soup.new_tag("li")
+
+        if hdr_names and len(hdr_names) >= 2 and len(vals) >= 2:
+            parts = []
+            # Pakk sammen “Header: verdi”
+            up_to = min(len(hdr_names), len(vals))
+            for i in range(up_to):
+                h = hdr_names[i]
+                v = vals[i]
+                if h and v:
+                    parts.append(f"{h}: {v}")
+                elif v:
+                    parts.append(v)
+            # ta med evt. overskytende verdier
+            if len(vals) > up_to:
+                parts.extend(vals[up_to:])
+            text = "; ".join(parts).strip()
+        else:
+            text = "; ".join(vals).strip()
+
+        # Ekstra sikkerhet: fjern evt. doble skilletegn hvis noe skulle glippe
+        text = re.sub(r'\s*;\s*;\s*', '; ', text)
+        li.string = text
+        ul.append(li)
+
+    return ul if ul.find("li") else None
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -12401,6 +12582,80 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
     # 2.10.7 Do not use tables purely as a formatting tool
     # TODO: The conversion of table to list should be done interactively
+
+    try:
+        llm = _ensure_llm_client(logger, getattr(args, "llm", False)) if getattr(args, "llm", False) else None
+    except NameError:
+        llm = None  # _ensure_llm_client finnes ikke i dette miljøet
+
+    converted, skipped_complex, skipped_heur, skipped_llm = 0, 0, 0, 0
+    created_uls = []
+
+    for table in list(soup.find_all("table")):
+        # Idempotens
+        if table.get("data-processed-table-as-list") == "true":
+            continue
+        if _has_complex_content(table):
+            skipped_complex += 1
+            continue
+
+        is_layout, reason = _estimate_layout_table(table)
+        if not is_layout and llm:
+            llm_decision = _llm_agrees_layout(table, llm, logger)
+            if llm_decision is False:
+                skipped_llm += 1
+                continue
+            if llm_decision is True:
+                is_layout = True
+
+        if not is_layout:
+            skipped_heur += 1
+            continue
+
+        cap = _caption_text(table)
+        header_exists = bool(_has_any_header(table))
+        ul = _make_ul_from_table(table, soup, use_headers=header_exists)
+        if not ul:
+            skipped_heur += 1
+            continue
+
+        # Sett inn caption som <p> foran lista
+        if cap:
+            pcap = soup.new_tag("p")
+            pcap["class"] = ["table-caption"]
+            pcap.string = cap
+            table.insert_before(pcap)
+
+        table.insert_before(ul)
+        created_uls.append(ul)
+
+        table["data-processed-table-as-list"] = "true"
+        table.decompose()
+        converted += 1
+
+    logger.info(
+        "2.10.7 - Done. Converted=%d, skipped_complex=%d, skipped_heuristics=%d, skipped_llm=%d",
+        converted, skipped_complex, skipped_heur, skipped_llm
+    )
+
+    # --- Lett etter-validering (logger kun) -------------------------------------
+    bad_semicolons = 0
+    bad_header_pairs = 0
+
+    for ul in created_uls:
+        for li in ul.find_all("li", recursive=False):
+            t = re.sub(r"\s+", " ", (li.get_text(" ", strip=True) or ""))
+            if re.search(r";\s*;", t):
+                bad_semicolons += 1
+            # “Header: ” uten verdi (slutter rett etter kolon eller før semikolon/slutt)
+            if re.search(r":[\s]*(;|$)", t):
+                bad_header_pairs += 1
+
+    if bad_semicolons or bad_header_pairs:
+        logger.warning(
+            "2.10.7 - Post-check: double-separators=%d, header-without-value=%d",
+            bad_semicolons, bad_header_pairs
+        )
 
     # 2.10.8 Spreadsheets as tables
     # This requirement should be covered by SMR 2.3.7.1
