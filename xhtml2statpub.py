@@ -5769,6 +5769,188 @@ def _wrap_into_paragraphs(soup, nodes: list):
     paras = [p for p in paras if p.get_text("", strip=True)]
     return paras
 
+# --- Hjelpere for 2.5.2 ----------------------------------------------------
+
+_TASKISH_TOKENS = {
+    "assessment","assessments","exercise","exercises",
+    "practice","task","tasks","question","questions"
+}
+_ANSWERISH_TOKENS = {"answer","answers","key","fasit"}
+
+_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
+
+def _epub_types(el: Tag) -> set[str]:
+    t = (el.get("epub:type") or "").lower()
+    return set(t.replace(";", " ").replace(",", " ").split()) if t else set()
+
+def _is_task_container(el: Tag) -> bool:
+    if not getattr(el, "name", None): return False
+    cls = set(el.get("class", []) or [])
+    if "task" in cls: return True
+    return bool(_epub_types(el) & _TASKISH_TOKENS)
+
+def _is_answer_container(el: Tag) -> bool:
+    if not getattr(el, "name", None): return False
+    cls = set(el.get("class", []) or [])
+    if "key" in cls: return True
+    return bool(_epub_types(el) & _ANSWERISH_TOKENS)
+
+def _nearest_heading_level(node: Tag) -> int:
+    # finn nærmeste heading over, og bruk +1 (maks h6)
+    anc = node
+    while anc is not None:
+        for child in anc.find_all(_HEADING_RX, recursive=False):
+            m = _HEADING_RX.match(child.name)
+            if m:
+                return min(int(m.group(1)) + 1, 6)
+        anc = anc.parent
+    return 3
+
+def _roman(n: int, upper=True) -> str:
+    vals = [(1000,'M'),(900,'CM'),(500,'D'),(400,'CD'),(100,'C'),(90,'XC'),(50,'L'),(40,'XL'),(10,'X'),(9,'IX'),(5,'V'),(4,'IV'),(1,'I')]
+    out = []
+    x = max(1, min(n, 3999))
+    for v, s in vals:
+        while x >= v:
+            out.append(s)
+            x -= v
+    s = "".join(out)
+    return s if upper else s.lower()
+
+def _alpha(n: int, upper=False) -> str:
+    # 1->a, 27->aa (som CSS counters)
+    n = max(1, n)
+    chars = []
+    while n > 0:
+        n -= 1
+        chars.append(chr((n % 26) + ord('A' if upper else 'a')))
+        n //= 26
+    return "".join(reversed(chars))
+
+def _ol_token_for_index(ol: Tag, idx0_based: int, li_value: int | None) -> str:
+    # idx0_based: 0 for første element i ol (uavh. av start)
+    start = int(ol.get("start", "1") or "1")
+    base = (li_value if li_value is not None else (start + idx0_based))
+    typ  = (ol.get("type") or "1")
+    if typ in ("1", ""):
+        return str(base)
+    if typ == "a":
+        return _alpha(base, upper=False)
+    if typ == "A":
+        return _alpha(base, upper=True)
+    if typ == "i":
+        return _roman(base, upper=False)
+    if typ == "I":
+        return _roman(base, upper=True)
+    # ukjent type → bruk tall
+    return str(base)
+
+def _li_position(li: Tag) -> int:
+    # 0-basert posisjon blant direkte <li>-søsken
+    sibs = [x for x in li.parent.find_all("li", recursive=False)]
+    try:
+        return sibs.index(li)
+    except ValueError:
+        return 0
+
+def _build_number_path(li: Tag) -> list[str]:
+    """
+    Bygg nummersti oppover for nested <ol>: f.eks. [ '1', '1' ] for 1.1
+    Stopper ved første ikke-<ol>-forelder.
+    """
+    parts = []
+    node = li
+    while node is not None and getattr(node, "name", None) == "li":
+        ol = node.parent if getattr(node.parent, "name", "") == "ol" else None
+        if not ol:
+            break
+        idx0 = _li_position(node)
+        li_val = None
+        try:
+            li_val = int(node.get("value")) if node.has_attr("value") else None
+        except Exception:
+            li_val = None
+        parts.append(_ol_token_for_index(ol, idx0, li_val))
+        # gå videre opp: finn li som inneholder denne ol-en (nested list)
+        # dvs: node = ancestor li som er forelder til ol
+        anc = ol.parent
+        while anc is not None and getattr(anc, "name", None) != "li":
+            anc = anc.parent
+        node = anc
+    return list(reversed(parts))
+
+_UC_LETTER_PREFIX_RX = re.compile(r"^\s*([A-ZÆØÅ])\b")
+
+def _trailing_uc_letter_from_li(li: Tag) -> str | None:
+    """
+    Hvis selve teksten i li starter med en enkelt stor bokstav (A, B, …, Æ/Ø/Å),
+    returner den, ellers None. (For å støtte '1.1 U'.)
+    Vi *fjerner ikke* denne fra innholdet (konservativt).
+    """
+    # finn første betydelige tekst i li (uten å gå inn i nested lister/section)
+    for child in li.find_all(recursive=False):
+        if getattr(child, "name", None) in {"ol","ul","section"}:
+            continue
+        txt = child.get_text(" ", strip=True) if isinstance(child, Tag) else ""
+        if not txt and isinstance(child, NavigableString):
+            txt = str(child).strip()
+        if txt:
+            m = _UC_LETTER_PREFIX_RX.match(txt)
+            if m:
+                return m.group(1)
+            break
+    return None
+
+def _ensure_section_in_li(li: Tag, cls: str, soup) -> Tag:
+    """
+    Sørg for at første betydelige barn i li er <section class=cls>.
+    Returner denne seksjonen.
+    """
+    first = None
+    for c in li.contents:
+        if isinstance(c, NavigableString) and not c.strip():
+            continue
+        first = c
+        break
+
+    if isinstance(first, Tag) and first.name == "section" and cls in (first.get("class", []) or []):
+        return first
+
+    # Hvis første barn er section, men 'feil' klasse → beholde men justere klassen
+    if isinstance(first, Tag) and first.name == "section":
+        classes = set(first.get("class", []) or [])
+        classes.discard("task"); classes.discard("key")
+        classes.add(cls)
+        first["class"] = list(classes)
+        return first
+
+    # Ellers: opprett section og flytt alt inn
+    sec = soup.new_tag("section")
+    sec["class"] = [cls]
+    li.insert(0, sec)
+    # flytt resten av innholdet inn i section
+    # NB: må iterere over en kopi
+    rest = [x for x in li.contents if x is not sec]
+    for n in rest:
+        sec.append(n.extract())
+    return sec
+
+def _ensure_heading_in_section(sec: Tag, label: str, soup):
+    # dersom første barn er en heading → ikke gjør noe
+    first = None
+    for c in sec.contents:
+        if isinstance(c, NavigableString) and not c.strip():
+            continue
+        first = c
+        break
+    if isinstance(first, Tag) and _HEADING_RX.match(first.name or ""):
+        return
+
+    level = _nearest_heading_level(sec)
+    h = soup.new_tag(f"h{level}")
+    h.string = label
+    sec.insert(0, h)
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -10044,12 +10226,53 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         logger.info("2.5.1.19 - Done. moved_blocks=%d, touched_lists=%d", moved_blocks, touched_lists)
 
     # 2.5.2 Tasks in mathematics books
-    logger.info('2.5.2 - Tasks in mathematics books')
-    if args.mathematics: 
-        for task in soup(attrs={'epub:type':ASSESSMENTS}):
-            for subtask in task(attrs={'epub:type':ASSESSMENTS}):
-                subtask.wrap((section := soup.new_tag('section', attrs={'class':'task'})))
-                section.insert(0, (h := soup.new_tag('h' + find_header_level(subtask, logger))))
+    """
+    2.5.2 Tasks in mathematics books
+    - I oppgavekontekst: hver <li> får <section class="task"> + individuell heading.
+    - I fasit/svar: <section class="key"> + heading.
+    - Heading dannes av listenumre (støtter type/start/value) + ev. trailing stor bokstav (f.eks. 'U').
+    """
+    logger.info("2.5.2 - Tasks in mathematics books")
+    if not getattr(args, "mathematics", False):
+        logger.info("2.5.2 - Not a mathematics book; skipping.")
+    else:
+        wrapped_task = wrapped_key = 0
+
+        # Oppgavecontainere
+        for task in soup.find_all(True):
+            if not _is_task_container(task):
+                continue
+            # top-level li i lister
+            for lst in task.find_all(["ol","ul"]):
+                for li in lst.find_all("li", recursive=False):
+                    # bygg label
+                    parts = _build_number_path(li)
+                    if not parts:
+                        # hvis ul uten nummer, hopp (eller lag "•" – men spes sier nummererte oppg.)
+                        continue
+                    label = ".".join(parts)
+                    # ekstra stor bokstav i starten av innhold?
+                    extra = _trailing_uc_letter_from_li(li)
+                    if extra:
+                        label = f"{label} {extra}"
+
+                    sec = _ensure_section_in_li(li, "task", soup)
+                    _ensure_heading_in_section(sec, label, soup)
+                    wrapped_task += 1
+
+    # Fasit/svarcontainere
+    for keysec in soup.find_all(True):
+        if not _is_answer_container(keysec):
+            continue
+        for lst in keysec.find_all(["ol","ul"]):
+            for li in lst.find_all("li", recursive=False):
+                parts = _build_number_path(li)
+                label = ".".join(parts) if parts else "Svar"
+                sec = _ensure_section_in_li(li, "key", soup)
+                _ensure_heading_in_section(sec, label, soup)
+                wrapped_key += 1
+
+    logger.info("2.5.2 - Done. wrapped_task=%d, wrapped_key=%d", wrapped_task, wrapped_key)
 
     # 2.6 Sidebars, text boxes etc.
     logger.info('2.6 - Sidebars, text boxes etc.')
