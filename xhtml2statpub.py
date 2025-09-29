@@ -7763,6 +7763,149 @@ def _end_llm_is_endnotes_container(llm, context_html: str) -> bool | None:
         logger.debug(f"2.12.2 - LLM classification failed: {e}")
         return None
 
+# --- Hjelpere for § 2.13.1 -----------------------------------------------------
+
+
+_GRAM_LABELS = {
+    "FS","F","V","S","P","O","DO","IO","ADV","A","OBJ","SUBJ","K","C","PP","PR"
+}
+
+def _norm_label(s: str) -> str:
+    s = (s or "").strip()
+    s = s.replace(".", "").replace(":", "")
+    s = s.strip("()[]{}⟨⟩")
+    return s.upper()
+
+def _cell_text(el: Tag) -> str:
+    return " ".join(list(el.stripped_strings))
+
+def _is_significant(n) -> bool:
+    return not (isinstance(n, NavigableString) and not (str(n) or "").strip())
+
+# --- Heuristikk: tabell-basert analyse -----------------------------------
+
+def _looks_like_grammar_table(table: Tag) -> bool:
+    rows = table.find_all("tr", recursive=False)
+    if len(rows) < 2:
+        return False
+    top_cells = rows[0].find_all(["th","td"], recursive=False)
+    if len(top_cells) < 2:
+        return False
+    labels = [_norm_label(_cell_text(c)) for c in top_cells]
+    score = sum(1 for L in labels if L in _GRAM_LABELS)
+    return score >= max(2, len(labels)//2)
+
+def _table_to_bracketed_p(table: Tag, soup) -> Tag | None:
+    rows = table.find_all("tr", recursive=False)
+    if len(rows) < 2:
+        return None
+    top = rows[0].find_all(["th","td"], recursive=False)
+    bot = rows[1].find_all(["th","td"], recursive=False)
+    if not bot:
+        return None
+
+    labels = [_norm_label(_cell_text(c)) for c in top]
+    words  = [_cell_text(c) for c in bot]
+
+    if len(labels) < len(words) and any(labels):
+        labels = labels + [""] * (len(words) - len(labels))
+    elif len(labels) > len(words):
+        labels = labels[:len(words)]
+
+    out_segments: list[tuple[str|None, str]] = []
+    cur_label: str | None = None
+    cur_words: list[str] = []
+
+    def flush():
+        nonlocal cur_label, cur_words
+        if cur_words:
+            text = " ".join(w for w in cur_words if w)
+            if text:
+                out_segments.append((cur_label, text))
+        cur_label, cur_words = None, []
+
+    for i in range(len(words)):
+        lab = labels[i] if i < len(labels) else ""
+        w   = words[i]
+        if lab and _norm_label(lab) in _GRAM_LABELS:
+            flush()
+            cur_label = _norm_label(lab)
+            cur_words = [w] if w else []
+        else:
+            if cur_label is None and not cur_words:
+                cur_label = None
+                cur_words = [w] if w else []
+            else:
+                cur_words.append(w)
+
+    flush()
+
+    p = soup.new_tag("p")
+    parts = []
+    for lab, txt in out_segments:
+        if not txt:
+            continue
+        if lab:
+            parts.append(f"[{lab}: {txt}]")
+        else:
+            parts.append(txt)
+    p.string = " ".join(parts).strip()
+    if not p.string:
+        return None
+    p["data-sentence-analysis"] = "true"
+    return p
+
+# --- Heuristikk: span-basert analyse -------------------------------------
+
+def _looks_like_span_analysis(p: Tag) -> bool:
+    if p.name != "p":
+        return False
+    labels = []
+    for sp in p.find_all("span"):
+        cls = set(sp.get("class", []))
+        if "gram-label" in cls or sp.get("data-label"):
+            lab = _norm_label(sp.get("data-label") or sp.get_text(" ", strip=True))
+            if lab in _GRAM_LABELS:
+                labels.append(lab)
+    return len(labels) >= 2
+
+def _span_to_bracketed_p(par: Tag, soup) -> Tag | None:
+    parts = []
+    cur_label: str | None = None
+    buffer: list[str] = []
+
+    def flush():
+        nonlocal cur_label, buffer
+        txt = " ".join(t for t in buffer if t).strip()
+        if txt:
+            if cur_label:
+                parts.append(f"[{cur_label}: {txt}]")
+            else:
+                parts.append(txt)
+        cur_label, buffer = None, []
+
+    for node in par.contents:
+        if isinstance(node, Tag) and node.name == "span" and (
+            "gram-label" in set(node.get("class", [])) or node.get("data-label")
+        ):
+            lab = _norm_label(node.get("data-label") or node.get_text(" ", strip=True))
+            if lab in _GRAM_LABELS:
+                flush()
+                cur_label = lab
+                continue
+        if isinstance(node, NavigableString):
+            buffer.append(str(node))
+        elif isinstance(node, Tag):
+            buffer.append(node.get_text(" ", strip=True))
+
+    flush()
+    newp = soup.new_tag("p")
+    newp.string = " ".join(parts).strip()
+    if newp.string:
+        newp["data-sentence-analysis"] = "true"
+        return newp
+    return None
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -13303,6 +13446,49 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
     # 2.13.1 Sentence analysis
     # TODO: Find common formatting. Here is one example from 861800
+    converted_tables = 0
+    converted_spans  = 0
+    flagged_llm      = 0
+
+    # 1) Tabeller
+    for table in list(soup.find_all("table")):
+        if table.get("data-sentence-analysis") == "true":
+            continue
+        try:
+            if _looks_like_grammar_table(table):
+                p = _table_to_bracketed_p(table, soup)
+                if p:
+                    table.insert_before(p)
+                    table.decompose()
+                    converted_tables += 1
+                else:
+                    if getattr(args, "llm", False):
+                        table["data-llm-pending"] = "sentence-analysis"
+                        flagged_llm += 1
+        except Exception as e:
+            logger.debug(f"2.13.1 - Table conversion failed: {e}")
+
+    # 2) Span-baserte avsnitt
+    for par in list(soup.find_all("p")):
+        if par.get("data-sentence-analysis") == "true":
+            continue
+        try:
+            if _looks_like_span_analysis(par):
+                newp = _span_to_bracketed_p(par, soup)
+                if newp:
+                    par.replace_with(newp)
+                    converted_spans += 1
+                else:
+                    if getattr(args, "llm", False):
+                        par["data-llm-pending"] = "sentence-analysis"
+                        flagged_llm += 1
+        except Exception as e:
+            logger.debug(f"2.13.1 - Span conversion failed: {e}")
+
+    logger.info(
+        "2.13.1 - Done. Converted tables=%d, converted spans=%d, flagged_for_llm=%d",
+        converted_tables, converted_spans, flagged_llm
+    )
 
     # 2.13.2 Conjugation tables
     # TODO: The only relevant thing here is turning the table into
