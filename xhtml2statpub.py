@@ -6657,6 +6657,164 @@ def _move_pagebreak_to_block_level(pb: Tag):
     # Sett inn etter inline_ancestor (bevarer relativ posisjon best mulig)
     inline_ancestor.insert_after(pb)
 
+# --- Hjelpere for § 2.9.1 -----------------------------------------------------
+
+_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
+
+def _first_sig_child(tag: Tag):
+    for c in tag.contents:
+        if isinstance(c, NavigableString) and not c.strip():
+            continue
+        return c
+    return None
+
+def _next_sig_sibling(tag: Tag):
+    sib = tag.next_sibling
+    while sib is not None and isinstance(sib, NavigableString) and not str(sib).strip():
+        sib = sib.next_sibling
+    return sib
+
+def _prev_sig_sibling(tag: Tag):
+    sib = tag.previous_sibling
+    while sib is not None and isinstance(sib, NavigableString) and not str(sib).strip():
+        sib = sib.previous_sibling
+    return sib
+
+def _first_heading_child(section: Tag):
+    for c in section.contents:
+        if isinstance(c, Tag) and _HEADING_RX.match(c.name or ""):
+            return c
+    return None
+
+def _is_list(tag: Tag) -> bool:
+    return bool(tag and getattr(tag, "name", "").lower() in {"ol","ul"})
+
+def _is_li(tag: Tag) -> bool:
+    return bool(tag and getattr(tag, "name", "").lower() == "li")
+
+def _is_section(tag: Tag) -> bool:
+    return bool(tag and getattr(tag, "name", "").lower() == "section")
+
+def _move_pagebreak_out_of_p_safe(soup, pb: Tag) -> bool:
+    """Bruker split-funksjonen fra § 2.9 dersom pb fremdeles ligger i <p>."""
+    p = pb.parent
+    if not (p is not None and getattr(p, "name", "").lower() == "p"):
+        return False
+    # Gjenbruk fiks fra §2.9 (pass soup inn):
+    return _move_pagebreak_out_of_p(soup, pb)
+
+def _relocate_pagebreak_in_lists(pb: Tag) -> bool:
+    """
+    Plasser pagebreak ved slutten av siste <li> på forrige side:
+    - Hvis pb ligger *inni* et <li> → flytt til etter forrige <li> (eller før lista om ingen forrige).
+    - Hvis pb er direkte barn av <ol>/<ul>:
+      - Hvis den står *før* første <li> → flytt *før* lista.
+      - Ellers la den stå (den er allerede mellom <li>’er).
+    """
+    # Finn nærmeste li-ancestor
+    li_anc = pb.find_parent("li")
+    if li_anc is not None:
+        prev_li = li_anc.find_previous_sibling("li")
+        pb.extract()
+        if prev_li is not None:
+            prev_li.insert_after(pb)   # mellom prev_li og li_anc
+        else:
+            # først i lista → plasser pagebreak før lista
+            lst = li_anc.parent
+            lst.insert_before(pb)
+        return True
+
+    # Hvis pb ligger direkte i lista (mellom <li>)
+    parent = pb.parent
+    if _is_list(parent):
+        prev = _prev_sig_sibling(pb)
+        if not (_is_li(prev)):
+            # pb står før første li → flytt *før* lista
+            pb.extract()
+            parent.insert_before(pb)
+            return True
+        # ellers er den allerede mellom li-ene (ok)
+        return False
+
+    # pb ligger ikke i en liste
+    return False
+
+def _relocate_pagebreak_at_section_start(soup, pb: Tag) -> bool:
+    """
+    Der pagebreak ved start av *ny* <section> skal ligge:
+    - Mellom <section>-start og headingen i den nye seksjonen.
+    Håndterer tre tilfeller:
+    1) pb ligger som *forrige søsken* til en <section> → flytt inn foran heading.
+    2) pb ligger som *siste barn* i forrige <section> → flytt til neste <section> før heading.
+    3) pb ligger *i* ny <section> men *etter* heading → flytt *før* heading.
+    """
+    moved = False
+
+    # (1) pb rett før en section-søster
+    nxt = _next_sig_sibling(pb)
+    if _is_section(nxt):
+        head = _first_heading_child(nxt)
+        pb.extract()
+        if head is not None:
+            head.insert_before(pb)
+        else:
+            # ingen heading → først i seksjonen
+            first = _first_sig_child(nxt)
+            if first is not None:
+                first.insert_before(pb)
+            else:
+                nxt.append(pb)
+        return True
+
+    # (2) pb ligger som siste i en seksjon, og neste søsken er ny seksjon
+    par = pb.parent
+    if _is_section(par):
+        after_pb = _next_sig_sibling(pb)
+        if after_pb is None:
+            # pb er (siste) i seksjon; se om neste søsken til seksjonen er en ny seksjon
+            next_section = _next_sig_sibling(par)
+            if _is_section(next_section):
+                head = _first_heading_child(next_section)
+                pb.extract()
+                if head is not None:
+                    head.insert_before(pb)
+                else:
+                    first = _first_sig_child(next_section)
+                    if first is not None:
+                        first.insert_before(pb)
+                    else:
+                        next_section.append(pb)
+                return True
+
+    # (3) pb ligger *inne i* en seksjon, men etter headingen → flytt foran heading
+    sec = pb.find_parent("section")
+    if sec is not None:
+        head = _first_heading_child(sec)
+        if head is not None:
+            # sjekk om pb står før headingen allerede
+            cur = _first_sig_child(sec)
+            if cur is head and pb is not head:
+                # første barn er heading → pb står ikke først
+                pb.extract()
+                head.insert_before(pb)
+                return True
+            # pb etter heading? Flytt
+            # robust: hvis pb kommer etter heading i traverseringsrekkefølge, flytt
+            came_after = False
+            for el in sec.descendants:
+                if el is head:
+                    came_after = False
+                if el is pb:
+                    came_after = True
+                    break
+            # Liten heuristikk: hvis pb er søsken etter heading
+            if head.find_next(lambda t: t is pb) is not None:
+                pb.extract()
+                head.insert_before(pb)
+                return True
+
+    return moved
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -11337,36 +11495,57 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         )
 
     # 2.9.1 Relocation of page breaks
-    logger.info('2.9.1 - Relocation of page breaks')
-    for pagebreak in soup(attrs={'epub:type':'pagebreak'}):
+    """
+    § 2.9.1 Relocation of page breaks
+    Forutsetter at § 2.9 har normalisert alle pagebreaks til <div epub:type="pagebreak">.
+    Regler:
+      • Innen lister: plasser ved slutten av siste <li> på forrige side (aldri først i ny <li>).
+      • Ved ny <section>: plasser mellom seksjonsstart og heading, ikke på slutten av forrige seksjon.
+      • Inline-sikkerhet: hvis pb ligger i <p>, flytt den ut (bruker § 2.9-hjelper).
+    """
+    logger.info("2.9.1 - Relocation of page breaks")
 
-        # Lists
-        if {'ol','ul'}.intersection(set([parent.name for parent in pagebreak.parents])):
-            for parent in reversed(list(pagebreak.parents)):
-                if parent.name in ['ol', 'ul']:
-                    parent.insert_before(pagebreak)
-                    break
+    pagebreaks = [el for el in soup.find_all("div") if "pagebreak" in (el.get("epub:type") or "")]
+    if not pagebreaks:
+        logger.info("2.9.1 - No pagebreaks found.")
+    else:
+        moved_lists = moved_sections = moved_inline = 0
 
-        # Paragraphs
-        if 'p' in [parent.name for parent in pagebreak.parents]:
-            for parent in pagebreak.parents:
-                if parent.name == 'p':
-                    parent.insert_after(pagebreak)
-                    break
+        for pb in list(pagebreaks):
+            # 0) Sikkerhet – hvis pb (fortsatt) ligger i <p>, flytt ut først
+            if pb.parent is not None and getattr(pb.parent, "name", "").lower() == "p":
+                if _move_pagebreak_out_of_p_safe(soup, pb):
+                    moved_inline += 1
 
-        # Headings
-        elif [parent for parent in pagebreak.parents if parent.name and re.compile(r'^h[1-6]$').match(parent.name)]:
-            for parent in pagebreak.parents:
-                if re.compile(r'^h[1-6]$').match(parent.name):
-                    parent.insert_before(pagebreak)
-                    break
+            # 1) Liste-regel
+            changed = _relocate_pagebreak_in_lists(pb)
+            if changed:
+                moved_lists += 1
+                # Etter flytting: ikke videre regler på denne pb i denne runden
+                continue
 
-        # Sentences
-        # NOTE: This bit alters slightly the specification
-        # by moving the pagebreak to the beginning of the
-        # paragraph, rather than the end of the sentence.
-        elif pagebreak.parent.name == 'p':
-            pagebreak.parent.insert(0, pagebreak)
+            # 2) Seksjons-start-regel
+            changed = _relocate_pagebreak_at_section_start(soup, pb)
+            if changed:
+                moved_sections += 1
+                continue
+
+            # 3) "Inline til nærmeste punktum" — de facto håndteres av §2.9 ved at pb ikke ligger i <p>.
+            #    Hvis du likevel ønsker en heuristikk: hvis pb står rett mellom to <p>,
+            #    og forrige <p> ikke slutter på punktum, flytt pb *etter* forrige <p>.
+            prev = _prev_sig_sibling(pb)
+            nxt  = _next_sig_sibling(pb)
+            if isinstance(prev, Tag) and prev.name == "p" and isinstance(nxt, Tag) and nxt.name == "p":
+                # hvis forrige <p> ikke ender med setningsslutt, er det ofte mer naturlig at pb kommer etterpå uansett
+                endtxt = prev.get_text("", strip=True)
+                if endtxt and not re.search(r"[.!?…)]\s*$", endtxt):
+                    # la den stå – eller flytt etter prev? Vi velger å la den stå for idempotens/stabilitet.
+                    pass
+
+        logger.info(
+            "2.9.1 - Done. moved_in_lists=%d, moved_at_section_start=%d, fixed_inline=%d",
+            moved_lists, moved_sections, moved_inline
+        )
 
     # 2.10 Tables
     logger.info('2.10 - Tables')
