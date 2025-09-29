@@ -4755,6 +4755,159 @@ def _convert_2col_table_to_question_list(tbl: Tag, soup, logger) -> bool:
     tbl.decompose()
     logger.debug("2.5.1.9 - Converted 2-col table to questions list")
     return True
+
+# --- Hjelpere for §2.5.1.10 ------------------------------------------------------
+
+_CROSSWORD_TOKENS = {"crossword", "puzzle-crossword", "crossword-puzzle"}
+_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
+
+def _epub_types(el: Tag) -> set[str]:
+    raw = (el.get("epub:type") or "")
+    return {t for t in re.split(r"[\s;]+", raw.lower()) if t}
+
+def _doc_lang(soup) -> str:
+    html = getattr(soup, "html", None)
+    if not html:
+        return "no"
+    return (html.get("xml:lang") or html.get("lang") or "no").lower()
+
+def _label_across(lang: str) -> str:
+    return "Across" if lang.startswith("en") else "Vannrett"
+
+def _label_down(lang: str) -> str:
+    return "Down" if lang.startswith("en") else "Loddrett"
+
+def _normalize_ul_plain(lst: Tag) -> bool:
+    if lst.name != "ul":
+        return False
+    changed = False
+    cls = set(lst.get("class", []) or [])
+    style = (lst.get("style") or "").strip().lower()
+    # alt som tyder på kuleløs liste → class=list-unstyled
+    if ("plain" in cls) or ("list-style-type-none" in cls) or ("list-unstyled" in cls) or ("list-style-type:none" in style) or ("list-style: none" in style):
+        if "list-unstyled" not in cls:
+            cls.add("list-unstyled"); lst["class"] = list(cls); changed = True
+        if "style" in lst.attrs:
+            new_style = re.sub(r"(?:^|;)\s*list-style-type\s*:\s*none\s*;?", "", lst["style"], flags=re.I).strip()
+            if new_style: lst["style"] = new_style
+            else: del lst["style"]
+            changed = True
+    return changed
+
+def _ensure_list_title_before(lst: Tag, title_text: str) -> bool:
+    prev = lst.previous_sibling
+    while isinstance(prev, NavigableString) and not prev.strip():
+        prev = prev.previous_sibling
+    if isinstance(prev, Tag) and prev.name == "p" and prev.get_text("", strip=True) == title_text:
+        return False
+    p = lst.new_tag("p"); p.string = title_text
+    lst.insert_before(p)
+    return True
+
+def _guess_list_role(lst: Tag, lang: str) -> str | None:
+    """Forsøk å lese 'Across/Vannrett' vs 'Down/Loddrett' fra nærliggende heading/p."""
+    # Sjekk forrige element
+    prev = lst.previous_sibling
+    while isinstance(prev, NavigableString) and not prev.strip():
+        prev = prev.previous_sibling
+    if isinstance(prev, Tag):
+        txt = prev.get_text(" ", strip=True).lower()
+        if "across" in txt or "vannrett" in txt:
+            return "across"
+        if "down" in txt or "loddrett" in txt:
+            return "down"
+    # Sjekk nærmeste heading over
+    cur = lst.previous_sibling
+    while isinstance(cur, Tag):
+        name = getattr(cur, "name", "") or ""
+        if _HEADING_RX.match(name):
+            t = cur.get_text(" ", strip=True).lower()
+            if "across" in t or "vannrett" in t:
+                return "across"
+            if "down" in t or "loddrett" in t:
+                return "down"
+            break
+        cur = cur.previous_sibling
+    return None
+
+def _ensure_ul_not_ol(lst: Tag) -> Tag:
+    if lst.name == "ul":
+        return lst
+    # konverter <ol> → <ul>
+    ul = lst.new_tag("ul")
+    # behold items
+    for c in list(lst.contents):
+        ul.append(c.extract())
+    lst.replace_with(ul)
+    return ul
+
+def _has_crossword_image(container: Tag) -> bool:
+    # enten direkte <img>, eller <figure><img>
+    if container.find("img"):
+        return True
+    if container.find("figure") and container.find("figure").find("img"):
+        return True
+    return False
+
+# --- Hjelpere for §2.5.1.11 ------------------------------------------------------
+
+def _get_text(node) -> str:
+    return "" if node is None else (node.get_text("", strip=True) if isinstance(node, Tag) else str(node).strip())
+
+def _single_unicode_letter(s: str) -> str | None:
+    # Normaliser til NFC for å få prekomponerte tegn der det er mulig
+    t = unicodedata.normalize("NFC", (s or "").strip())
+    # Én enkelt bokstav?
+    if len(t) == 1 and t.isalpha():
+        return t.lower()
+    return None
+
+def _is_letter_cell(td: Tag) -> bool:
+    return _single_unicode_letter(_get_text(td)) is not None
+
+def _cell_letter(td: Tag) -> str | None:
+    return _single_unicode_letter(_get_text(td))
+
+def _table_is_wordsearch(tbl: Tag) -> tuple[bool, list[list[str]]]:
+    """
+    Returnerer (is_wordsearch, rows_letters)
+    rows_letters = liste av rader, hver rad en liste med bokstaver (små).
+    Tabell må være minst 3x3 og alle celler én bokstav.
+    """
+    rows = [tr for tr in tbl.find_all("tr", recursive=False)]
+    if len(rows) < 3:
+        return False, []
+    grid: list[list[str]] = []
+    cols_count = None
+    for tr in rows:
+        cells = tr.find_all(["td", "th"], recursive=False)
+        if len(cells) < 3:
+            return False, []
+        row_letters = []
+        for c in cells:
+            if not _is_letter_cell(c):
+                return False, []
+            ch = _cell_letter(c)
+            if ch is None:
+                return False, []
+            row_letters.append(ch)
+        if cols_count is None:
+            cols_count = len(row_letters)
+        elif len(row_letters) != cols_count:
+            return False, []  # ujevn bredde
+        grid.append(row_letters)
+    return True, grid
+
+def _ensure_figcaption_copied(tbl: Tag, fig: Tag):
+    # Hvis det finnes en <caption> under tabellen, konverter til <figcaption>
+    cap = tbl.find("caption")
+    if cap:
+        figcap = fig.new_tag("figcaption")
+        # flytt innhold
+        for n in list(cap.contents):
+            figcap.append(n.extract())
+        fig.append(figcap)
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -8280,18 +8433,149 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
     # 2.5.1.10 Crossword puzzles
     # TODO: check how crosswords are marked up in original
+    """
+    2.5.1.10 Crossword puzzles
+    - Kryssord skal markeres som BILDE; ledetråder i to <ul class="list-unstyled">.
+    - Titler: (en) Down/Across, (andre) Vannrett/Loddrett.
+    - Idempotent; konverterer <ol>→<ul>, legger til titler hvis mangler, normaliserer kuleløs <ul>.
+    """
+    logger.info("2.5.1.10 - Crossword puzzles")
+
+    lang = _doc_lang(soup)
+    processed = 0
+    ensured_titles = 0
+    normalized_uls = 0
+    converted_ols = 0
+    warned_no_img = 0
+
+    # Finn kryssord-containere
+    containers = []
+    for el in soup.find_all(True):
+        if not isinstance(el, Tag):
+            continue
+        et = _epub_types(el)
+        classes = set(el.get("class", []) or [])
+        if (et & _CROSSWORD_TOKENS) or ("crossword" in classes):
+            containers.append(el)
+
+    for cont in containers:
+        processed += 1
+
+        # 1) Sørg for at kryssordet er bilde
+        if not _has_crossword_image(cont):
+            # Vi konverterer ikke tabell-rutenett → bilde automatisk (risiko for datatap).
+            logger.warning("2.5.1.10 - Crossword container has no <img>; leaving as-is to avoid data loss.")
+            warned_no_img += 1
+
+        # 2) Finn inntil to lister for ledetråder (across/down)
+        # Vi ser etter lister på første nivå i container; hvis få, prøv dypere.
+        lists = [l for l in cont.find_all(["ol", "ul"], recursive=False)]
+        if len(lists) < 2:
+            lists = cont.find_all(["ol", "ul"])
+
+        # Filtrer ut lister som tydelig ikke er ledetråder (helt tomme etc.)
+        lists = [l for l in lists if l.find("li")]
+
+        # Hold på maks to – spesifikasjonen nevner to lister
+        lists = lists[:2]
+
+        # Rolle-gjetting
+        roles = []
+        for lst in lists:
+            role = _guess_list_role(lst, lang)
+            roles.append(role)
+
+        # 3) Normaliser listetype til <ul> og class='list-unstyled'
+        for i, lst in enumerate(lists):
+            if lst.name == "ol":
+                lists[i] = _ensure_ul_not_ol(lst); converted_ols += 1
+        for lst in lists:
+            if _normalize_ul_plain(lst):
+                normalized_uls += 1
+            # hvis fortsatt ikke unstyled, sett den
+            cls = set(lst.get("class", []) or [])
+            if "list-unstyled" not in cls:
+                cls.add("list-unstyled")
+                lst["class"] = list(cls)
+                normalized_uls += 1
+
+        # 4) Sørg for titler før listene
+        if lists:
+            # Bestem rekkefølge/titler
+            # Prøv å tilordne 'across'/'down' hvis vi klarte å gjette
+            title_map = {}
+            for lst, role in zip(lists, roles):
+                if role == "across":
+                    title_map[lst] = _label_across(lang)
+                elif role == "down":
+                    title_map[lst] = _label_down(lang)
+
+            # For de som ikke fikk rolle, fall tilbake til standardrekkefølge
+            leftovers = [lst for lst in lists if lst not in title_map]
+            if leftovers:
+                # språkspesifikk standardrekkefølge: (en) Down, Across — (andre) Vannrett, Loddrett
+                defaults = [_label_down(lang), _label_across(lang)] if lang.startswith("en") else [_label_across(lang), _label_down(lang)]
+                for lst, ttl in zip(leftovers, defaults):
+                    if lst not in title_map:
+                        title_map[lst] = ttl
+
+            # Set/tildel titler
+            for lst in lists:
+                if _ensure_list_title_before(lst, title_map[lst]):
+                    ensured_titles += 1
+
+    logger.info(
+        "2.5.1.10 - Done. containers=%d, titles_set=%d, uls_normalized=%d, ols_converted=%d, no_img_warnings=%d",
+        processed, ensured_titles, normalized_uls, converted_ols, warned_no_img
+    )
 
     # 2.5.1.11 Tables with one letter in each cell (Word search)
-    logger.info('2.5.1.11 Tables with one letter in each cell (Word search)')
-    for table in soup('table'):
-        if all([(th.string and len(str(th.string)) == 1) for th in table('td')]):
-            table.name = 'figure'
-            for tr in table('tr'):
-                tr.name = 'p'
-                for cell in tr(['th', 'td']):
-                    tr.append(cell.string + ' ' if cell.string else '') # TODO: check
-                    cell.decompose()
-                tr.string = str(tr.string).strip()
+    """
+    2.5.1.11 Tables with one letter in each cell (Word search)
+    - Fjern tabell, lag én <p> per rad med små bokstaver separert av space.
+    - Pakk resultatet i <figure class="word-search">.
+    - Bevar ev. caption som <figcaption>.
+    - Idempotent.
+    """
+    logger.info("2.5.1.11 - Word search (tables with one letter per cell)")
+
+    converted = 0
+    skipped = 0
+
+    # Hopp over figurer som allerede er word-search
+    processed_tables = set()
+
+    for tbl in list(soup.find_all("table")):
+        # idempotens: hvis tabellen allerede er konvertert i en tidligere runde, hopp
+        if tbl in processed_tables:
+            continue
+
+        ok, grid = _table_is_wordsearch(tbl)
+        if not ok:
+            skipped += 1
+            continue
+
+        # Lag figure
+        fig = soup.new_tag("figure")
+        fig["class"] = (fig.get("class") or []) + ["word-search"]
+
+        # Sett inn figure før tabellen
+        tbl.insert_before(fig)
+
+        # Bevar evt. caption -> figcaption
+        _ensure_figcaption_copied(tbl, fig)
+
+        # Lag <p> per rad: "a b c d ..."
+        for row in grid:
+            p = soup.new_tag("p")
+            p.append(NavigableString(" ".join(row)))
+            fig.append(p)
+
+        # Fjern tabellen
+        tbl.decompose()
+        converted += 1
+
+    logger.info("2.5.1.11 - Done. converted=%d, skipped=%d", converted, skipped)
 
     # 2.5.1.12 Tasks with figures
     # Follows from SMR 2.1.2, SMR 2.3.5 and SMR 2.4.4.2
