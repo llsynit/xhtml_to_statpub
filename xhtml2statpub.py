@@ -8124,6 +8124,188 @@ def _convert_conjugation_table(table: Tag, soup, logger) -> bool:
     logger.debug("2.13.2 - Converted a conjugation table to list(s).")
     return True
 
+# --- Hjelpere for § 2.14 -----------------------------------------------------
+
+_H_RX = re.compile(r"^h([1-6])$", re.I)
+
+def _txt(n): return "".join(n.stripped_strings)
+
+def _tokenize(val: str) -> set[str]:
+    return set((val or "").lower().replace(";", " ").replace(",", " ").split())
+
+def _is_poem_explicit(tag: Tag) -> bool:
+    if getattr(tag, "name", None) is None:
+        return False
+    if tag.name == "section":
+        cls = _tokenize(" ".join(tag.get("class", [])))
+        if "poem" in cls: return True
+        et = _tokenize(tag.get("epub:type", ""))
+        if "poem" in et or "z3998:poem" in et: return True
+    # Enkel støtte for <div class="poem"> som container
+    if tag.name in {"div","article"}:
+        cls = _tokenize(" ".join(tag.get("class", [])))
+        et = _tokenize(tag.get("epub:type", ""))
+        if ("poem" in cls) or ("poem" in et) or ("z3998:poem" in et):
+            return True
+    return False
+
+def _already_normalized(sec: Tag) -> bool:
+    if getattr(sec, "name", None) != "section":
+        return False
+    cls = _tokenize(" ".join(sec.get("class", [])))
+    if "poem" not in cls:
+        return False
+    return bool(sec.find("div", class_="linegroup", recursive=False))
+
+def _find_heading_in_or_before(container: Tag) -> Tag | None:
+    # 1) direkte barn
+    for h in container.find_all(_H_RX, recursive=False):
+        return h
+    # 2) nærmeste forrige søsken
+    sib = container.previous_sibling
+    while sib is not None:
+        if isinstance(sib, Tag) and _H_RX.match(sib.name or ""):
+            return sib
+        sib = sib.previous_sibling
+    return None
+
+def _ensure_section_poem(container: Tag, soup) -> Tag:
+    if container.name == "section":
+        cls = set(container.get("class", []) or [])
+        cls.add("poem")
+        container["class"] = list(cls)
+        return container
+    sec = soup.new_tag("section")
+    sec["class"] = ["poem"]
+    container.insert_before(sec)
+    sec.append(container.extract())
+    return sec
+
+def _split_p_on_br(p: Tag) -> list[list]:
+    """Returner linjer som lister av noder; splitter på <br>."""
+    lines, buf = [], []
+    for child in list(p.children):
+        if isinstance(child, Tag) and child.name == "br":
+            lines.append(buf); buf = []
+            child.extract()
+        else:
+            buf.append(child.extract())
+    lines.append(buf)
+    # fjern helt tomme linjer
+    return [ln for ln in lines if any((isinstance(x, Tag) or (isinstance(x, NavigableString) and x.strip())))]
+
+def _append_linegroup(sec: Tag, soup, stanzas: list[list[list]]):
+    for stanza in stanzas:
+        lg = soup.new_tag("div"); lg["class"] = ["linegroup"]
+        for nodes in stanza:
+            pl = soup.new_tag("p"); pl["class"] = ["line"]
+            for n in nodes: pl.append(n)
+            # trim ytterkanter
+            if pl.contents and isinstance(pl.contents[0], NavigableString):
+                pl.contents[0].replace_with(NavigableString(str(pl.contents[0]).lstrip()))
+            if pl.contents and isinstance(pl.contents[-1], NavigableString):
+                pl.contents[-1].replace_with(NavigableString(str(pl.contents[-1]).rstrip()))
+            lg.append(pl)
+        sec.append(lg)
+
+def _guess_stanzas_from_lines(lines: list[list]) -> list[list[list]]:
+    """Del på blanke linjer; hvis ingen blanke → én strofe."""
+    stanzas, cur = [], []
+    for ln in lines:
+        if len(ln) == 1 and isinstance(ln[0], NavigableString) and not ln[0].strip():
+            if cur: stanzas.append(cur); cur = []
+        else:
+            cur.append(ln)
+    if cur: stanzas.append(cur)
+    return stanzas or [lines]
+
+def _extract_author_candidate(container: Tag) -> Tag | None:
+    # Eksplisitt
+    p = container.find("p", attrs={"epub:type": re.compile(r"(^| )z3998:author( |$)", re.I)}, recursive=False)
+    if p: return p
+    # Klassehint
+    for cand in container.find_all("p", recursive=False):
+        cls = _tokenize(" ".join(cand.get("class", [])))
+        if {"author","forfatter","poet"} & cls:
+            return cand
+    # Kort siste-linje, ofte navn
+    ps = container.find_all("p", recursive=False)
+    if ps:
+        tail = ps[-1]
+        t = _txt(tail)
+        if 2 <= len(t.split()) <= 7:
+            return tail
+    return None
+
+def _place_author_after_linegroups(sec: Tag, author_p: Tag):
+    author_p["epub:type"] = "z3998:author"
+    author_p.extract()
+    # finn siste linegroup
+    last_lg = None
+    for lg in sec.find_all("div", class_="linegroup", recursive=False):
+        last_lg = lg
+    if last_lg is not None:
+        last_lg.insert_after(author_p)
+    else:
+        sec.append(author_p)
+
+def _ensure_ids(sec: Tag, heading: Tag | None, soup):
+    if heading and not heading.get("id"):
+        base = "poem-title"; i = 1; hid = base
+        while soup.find(id=hid): i += 1; hid = f"{base}-{i}"
+        heading["id"] = hid
+    if heading and heading.get("id"):
+        sec["aria-labelledby"] = heading["id"]
+    if not sec.get("id"):
+        i = 1
+        while soup.find(id=f"poem-{i}"): i += 1
+        sec["id"] = f"poem-{i}"
+
+def _normalize_poem_container(container: Tag, soup, *, logger) -> bool:
+    if _already_normalized(container):
+        return False
+
+    # Finn og flytt heading (om nødvendig)
+    heading = _find_heading_in_or_before(container)
+    sec = _ensure_section_poem(container, soup)
+
+    if heading and heading.parent is not sec:
+        sec.insert(0, heading.extract())
+
+    # Lag linjer/linegroup(s)
+    ps = sec.find_all("p", recursive=False)
+    has_line = any("line" in (p.get("class", []) or []) for p in ps)
+    if has_line:
+        # bare pakk eksisterende p.line i linegroup om ikke finnes
+        if not sec.find("div", class_="linegroup", recursive=False):
+            lg = soup.new_tag("div"); lg["class"] = ["linegroup"]
+            for p in [p for p in ps if "line" in (p.get("class", []) or [])]:
+                lg.append(p.extract())
+            sec.append(lg)
+    else:
+        lines = []
+        for p in list(ps):
+            brs = p.find_all("br")
+            if brs:
+                parts = _split_p_on_br(p)
+                lines.extend(parts if parts else [[NavigableString(_txt(p))]])
+                p.decompose()
+            else:
+                # Heuristikk: kort <p> → linje; ellers beholde som én linje likevel
+                nodes = [n.extract() for n in list(p.contents)]
+                lines.append(nodes if nodes else [NavigableString("")])
+                p.decompose()
+        stanzas = _guess_stanzas_from_lines(lines)
+        _append_linegroup(sec, soup, stanzas)
+
+    # Forfatterplassering
+    author = _extract_author_candidate(sec)
+    if author:
+        _place_author_after_linegroups(sec, author)
+
+    _ensure_ids(sec, heading, soup)
+    return True
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -13745,6 +13927,38 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
     # 2.14 Poems
     # TODO: Check original formats. This needs to be interactive
+    normalized, flagged = 0, 0
+
+    if getattr(args, "mathematics", False):
+        # Kun eksplisitt merkede dikt i matte (unngå falske positiver)
+        for tag in soup.find_all(["section","div","article"]):
+            if _is_poem_explicit(tag):
+                try:
+                    if _normalize_poem_container(tag, soup, logger=logger):
+                        normalized += 1
+                except Exception as e:
+                    logger.debug(f"2.14 - Failed (math mode) on one poem container: {e}")
+    else:
+        # Ikke-matte: normaliser eksplisitte, flagg kandidater
+        for tag in soup.find_all(["section","div","article","blockquote"]):
+            if _is_poem_explicit(tag):
+                try:
+                    if _normalize_poem_container(tag, soup, logger=logger):
+                        normalized += 1
+                except Exception as e:
+                    logger.debug(f"2.14 - Failed on one poem container: {e}")
+
+        # Flagge mulige dikt (kun hvis LLM er på)
+        if getattr(args, "llm", False):
+            for p in soup.find_all("p"):
+                if p.find_parent("section", class_="poem"):  # allerede håndtert
+                    continue
+                if len(p.find_all("br")) >= 3 and len(_txt(p)) <= 400:
+                    p["data-llm-pending"] = "poem-candidate"
+                    flagged += 1
+
+    logger.info("2.14 - Done. Normalized=%d, flagged_for_llm=%d", normalized, flagged)
+
 
     '''
 
