@@ -7906,6 +7906,224 @@ def _span_to_bracketed_p(par: Tag, soup) -> Tag | None:
         return newp
     return None
 
+# --- Hjelpere for § 2.13.2 -----------------------------------------------------
+
+def _doc_lang_local(soup) -> str:
+    html = getattr(soup, "html", None)
+    if not html:
+        return "no"
+    return (html.get("xml:lang") or html.get("lang") or "no").lower()
+
+# ---- Pronomen-ordlister (konservativt utvalg) ----------------------------
+_PRON_SETS = {
+    "no": {"jeg","du","han","hun","vi","dere","de"},
+    "nn": {"eg","du","han","ho","vi","de","dei","dåkker"},  # nn-varianter
+    "sv": {"jag","du","han","hon","vi","ni","de"},
+    "da": {"jeg","du","han","hun","vi","i","de"},
+    "en": {"i","you","he","she","it","we","they"},
+    "de": {"ich","du","er","sie","es","wir","ihr","sie"},
+    "fr": {"je","tu","il","elle","on","nous","vous","ils","elles"},
+    "es": {"yo","tú","tu","él","ella","usted","nosotros","nosotras","vosotros","vosotras","ellos","ellas","ustedes"},
+    "it": {"io","tu","lui","lei","noi","voi","loro"},
+}
+
+# slå sammen til en stor mengde for språkagnostisk sjekk
+_ALL_PRONS = set().union(*_PRON_SETS.values())
+
+def _normalize_token(s: str) -> str:
+    s = (s or "").strip()
+    # dropp kolon/parenteser/punktum som ofte følger etiketter
+    s = s.strip(":()[]{}.")
+    # bruk NFKD for å senke diakritika, men behold aksenter i spansk/fransk når vi sammenligner i settet:
+    # vi beholder original og en "av-aksentert" kopi for fallback-match.
+    return s
+
+def _strip_accents(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
+
+def _cell_text(el: Tag) -> str:
+    return " ".join(el.stripped_strings)
+
+def _first_data_row(table: Tag) -> Tag | None:
+    # hvis thead finnes, bruk første rad i tbody; ellers første <tr> etter en ev. header-rad
+    tbody = table.find("tbody", recursive=False)
+    if tbody:
+        tr = tbody.find("tr", recursive=False)
+        return tr
+    return table.find("tr", recursive=False)
+
+def _iter_rows(table: Tag):
+    tbody = table.find("tbody", recursive=False)
+    rows = (tbody.find_all("tr", recursive=False) if tbody else table.find_all("tr", recursive=False))
+    for tr in rows:
+        yield tr
+
+def _looks_like_conjugation_table(table: Tag) -> bool:
+    # krav: minst 3 rader (overskrift kan mangle), og minst 2 kolonner
+    rows = list(_iter_rows(table))
+    if len(rows) < 3:
+        return False
+    # se på første-celle i hver rad: er flertallet pronomen?
+    first_col = []
+    for tr in rows:
+        cells = tr.find_all(["th","td"], recursive=False)
+        if len(cells) < 2:
+            continue
+        first = _cell_text(cells[0]).strip().lower()
+        # fjern trailing kolon, parenteser
+        first = _normalize_token(first).lower()
+        first_col.append(first)
+    if len(first_col) < 3:
+        return False
+
+    # score: antall som matcher i pron-mengdene (med/uten diakritika)
+    hits = 0
+    for tok in first_col:
+        if not tok:
+            continue
+        if tok in _ALL_PRONS or _strip_accents(tok) in _ALL_PRONS:
+            hits += 1
+
+    # konservativ terskel: minst 50% av radene
+    return hits >= max(2, len(first_col) // 2)
+
+def _headers_for_columns(table: Tag) -> list[str]:
+    # hent kolonneoverskrifter fra thead eller første rad hvis den er <th>-dominert
+    headers: list[str] = []
+    thead = table.find("thead", recursive=False)
+    if thead:
+        hrow = thead.find("tr", recursive=False)
+        if hrow:
+            cells = hrow.find_all(["th","td"], recursive=False)
+            headers = [_cell_text(c) for c in cells]
+    else:
+        first_tr = table.find("tr", recursive=False)
+        if first_tr:
+            cells = first_tr.find_all(["th","td"], recursive=False)
+            # tell th-andel
+            if cells and sum(1 for c in cells if c.name == "th") >= max(1, len(cells)//2):
+                headers = [_cell_text(c) for c in cells]
+    return [h.strip() for h in headers]
+
+def _extract_caption(table: Tag) -> str | None:
+    cap = table.find("caption")
+    if cap:
+        return cap.get_text(" ", strip=True)
+    title = table.get("title")
+    if title:
+        return str(title).strip()
+    return None
+
+def _make_title_p(soup, text: str) -> Tag:
+    p = soup.new_tag("p")
+    strong = soup.new_tag("strong")
+    strong.string = text
+    p.append(strong)
+    return p
+
+def _convert_conjugation_table(table: Tag, soup, logger) -> bool:
+    if table.get("data-conjugation-converted") == "true":
+        return False
+
+    if not _looks_like_conjugation_table(table):
+        return False
+
+    rows = list(_iter_rows(table))
+    if not rows:
+        return False
+
+    # Hvis første rad ser ut til å være header, dropp den fra data
+    col_headers = _headers_for_columns(table)
+    data_rows = rows[:]
+    if col_headers and len(rows) > 1:
+        # anta at første rad er header, fjern den
+        data_rows = rows[1:]
+
+    # bygg container
+    wrapper = soup.new_tag("div")
+    wrapper["class"] = ["conjugation"]
+    wrapper["data-conjugation-converted"] = "true"
+
+    # caption/overskrift (valgfritt)
+    cap = _extract_caption(table)
+    if cap:
+        wrapper.append(_make_title_p(soup, cap))
+
+    # tell antall kolonner i data (min med radene)
+    max_cols = 0
+    for tr in data_rows:
+        cells = tr.find_all(["th","td"], recursive=False)
+        max_cols = max(max_cols, len(cells))
+
+    if max_cols < 2:
+        return False  # ikke sikkert en konjugasjon
+
+    # kolonne-navn utover 1. kolonne
+    names_for_cols: list[str] = []
+    if col_headers and len(col_headers) >= 2:
+        names_for_cols = col_headers[1:]
+    else:
+        # prøv å hente fra vertikale header-celler i første kolonne? (vanskelig) → generiske navn
+        for j in range(2, max_cols+1):
+            names_for_cols.append(f"Form {j-1}")
+
+    # 2 kolonner → én liste
+    if max_cols == 2:
+        ul = soup.new_tag("ul")
+        ul["class"] = ["list-unstyled", "conjugation-list"]
+        for tr in data_rows:
+            cells = tr.find_all(["th","td"], recursive=False)
+            if len(cells) < 2:
+                continue
+            person = _cell_text(cells[0]).strip()
+            form   = _cell_text(cells[1]).strip()
+            if not (person or form):
+                continue
+            li = soup.new_tag("li")
+            # Person: form
+            span_p = soup.new_tag("span"); span_p["class"] = ["person"]; span_p.string = person
+            span_c = soup.new_tag("span"); span_c["class"] = ["form"]
+            if form:
+                span_c.string = f": {form}"
+            else:
+                span_c.string = ":"
+            li.append(span_p); li.append(span_c)
+            ul.append(li)
+        wrapper.append(ul)
+
+    else:
+        # ≥3 kolonner → én liste per kolonne 2..N
+        for col_idx in range(1, max_cols):
+            # overskrift for denne formen
+            heading = names_for_cols[col_idx-1] if col_idx-1 < len(names_for_cols) else f"Form {col_idx}"
+            wrapper.append(_make_title_p(soup, heading))
+            ul = soup.new_tag("ul")
+            ul["class"] = ["list-unstyled", "conjugation-list"]
+            for tr in data_rows:
+                cells = tr.find_all(["th","td"], recursive=False)
+                if len(cells) <= col_idx:
+                    continue
+                person = _cell_text(cells[0]).strip()
+                form   = _cell_text(cells[col_idx]).strip()
+                if not (person or form):
+                    continue
+                li = soup.new_tag("li")
+                span_p = soup.new_tag("span"); span_p["class"] = ["person"]; span_p.string = person
+                span_c = soup.new_tag("span"); span_c["class"] = ["form"]
+                if form:
+                    span_c.string = f": {form}"
+                else:
+                    span_c.string = ":"
+                li.append(span_p); li.append(span_c)
+                ul.append(li)
+            wrapper.append(ul)
+
+    # sett inn før tabellen og fjern den
+    table.insert_before(wrapper)
+    table.decompose()
+    logger.debug("2.13.2 - Converted a conjugation table to list(s).")
+    return True
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -13493,6 +13711,37 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     # 2.13.2 Conjugation tables
     # TODO: The only relevant thing here is turning the table into
     # a list. Make interactive.
+    converted = 0
+    flagged   = 0
+
+    if getattr(args, "mathematics", False):
+        logger.info("2.13.2 - Mathematics book detected; skipping conjugation conversion to avoid false positives.")
+    else:
+        for table in list(soup.find_all("table")):
+            try:
+                if _convert_conjugation_table(table, soup, logger):
+                    converted += 1
+                else:
+                    # valgfritt: flagg for LLM dersom tabellen *kan* være grammatikk (svak indikasjon)
+                    # Her: hvis den har > 2 kolonner og minst 4 rader og 1. kolonne er “ord/enkeltord”
+                    rows = list(_iter_rows(table))
+                    if getattr(args, "llm", False) and len(rows) >= 4:
+                        first_col_texts = []
+                        for tr in rows:
+                            cells = tr.find_all(["th","td"], recursive=False)
+                            if len(cells) >= 2:
+                                tok = _normalize_token(_cell_text(cells[0]).strip()).lower()
+                                if tok:
+                                    first_col_texts.append(tok)
+                        # svak indikator: mange korte tokens i kolonne 1
+                        shortish = sum(1 for t in first_col_texts if len(t.split()) <= 2 and len(t) <= 12)
+                        if shortish >= max(3, len(first_col_texts)//2):
+                            table["data-llm-pending"] = "conjugation-candidate"
+                            flagged += 1
+            except Exception as e:
+                logger.debug(f"2.13.2 - Failed on one table: {e}")
+
+    logger.info("2.13.2 - Done. Converted=%d, flagged_for_llm=%d", converted, flagged)
 
     # 2.14 Poems
     # TODO: Check original formats. This needs to be interactive
