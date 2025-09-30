@@ -8306,6 +8306,167 @@ def _normalize_poem_container(container: Tag, soup, *, logger) -> bool:
     _ensure_ids(sec, heading, soup)
     return True
 
+# --- Hjelpere for § 2.15 -----------------------------------------------------
+
+_SKIP_TAGS = {"code", "pre", "math", "svg", "style", "script"}
+
+# Kartlegging for ikke-latinske skript -> xml:lang-kode (forenklet/konservativt)
+_SCRIPT_LANGS = [
+    ("el", re.compile(r"[\u0370-\u03FF]")),   # Greek
+    ("ru", re.compile(r"[\u0400-\u04FF]")),   # Cyrillic (ru som nøytral)
+    ("he", re.compile(r"[\u0590-\u05FF]")),   # Hebrew
+    ("ar", re.compile(r"[\u0600-\u06FF]")),   # Arabic
+    ("hi", re.compile(r"[\u0900-\u097F]")),   # Devanagari (Hindi)
+    ("th", re.compile(r"[\u0E00-\u0E7F]")),   # Thai
+    ("ja", re.compile(r"[\u3040-\u30FF]")),   # Hiragana/Katakana
+    ("zh", re.compile(r"[\u4E00-\u9FFF]")),   # CJK Unified Ideographs
+]
+
+_LATIN_RX = re.compile(r"[A-Za-z\u00C0-\u024F]")
+
+_EN_STOP = {"the","and","to","of","in","on","for","with","is","are","was",
+            "were","as","by","at","from","that","this"}
+
+def _doc_lang(soup) -> str:
+    html = getattr(soup, "html", None)
+    if not html:
+        return "no"
+    return (html.get("xml:lang") or html.get("lang") or "no").lower()
+
+def _closest_lang(node: Tag | NavigableString, default: str) -> str:
+    p = node if isinstance(node, Tag) else node.parent
+    while p is not None:
+        if isinstance(p, Tag):
+            v = (p.get("xml:lang") or p.get("lang"))
+            if v:
+                return v.lower()
+        p = getattr(p, "parent", None)
+    return default.lower()
+
+def _should_skip_textnode(text_node: NavigableString) -> bool:
+    if not text_node or not str(text_node).strip():
+        return True
+    anc = text_node.parent
+    while anc is not None:
+        if isinstance(anc, Tag) and anc.name in _SKIP_TAGS:
+            return True
+        anc = getattr(anc, "parent", None)
+    return False
+
+def _parent_has_lang(text_node: NavigableString) -> bool:
+    p = text_node.parent
+    if not isinstance(p, Tag):
+        return False
+    return p.has_attr("xml:lang") or p.has_attr("lang")
+
+def _find_script_runs(text: str):
+    """Returner ikke-latinske skriptkjerner som (start, end, lang), ikke overlappende."""
+    runs = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        matched = None
+        rx_use = None
+        for lang, rx in _SCRIPT_LANGS:
+            if rx.match(ch):
+                matched, rx_use = lang, rx
+                break
+        if matched:
+            j = i + 1
+            while j < n and rx_use.match(text[j]):
+                j += 1
+            runs.append((i, j, matched))
+            i = j
+        else:
+            i += 1
+    # slå sammen nabokjøringer av samme lang
+    merged = []
+    for st, en, lg in runs:
+        if merged and merged[-1][2] == lg and st == merged[-1][1]:
+            merged[-1] = (merged[-1][0], en, lg)
+        else:
+            merged.append((st, en, lg))
+    return merged
+
+def _find_latin_englishish_runs(text: str, min_len=12):
+    """Konservativ flagging av latinsk-tekst som sannsynligvis er engelsk."""
+    candidates = []
+    for m in re.finditer(r"([A-Za-z\u00C0-\u024F][A-Za-z\u00C0-\u024F'\- ]{"+str(min_len)+r",})", text):
+        seg = m.group(0)
+        toks = re.findall(r"[A-Za-z']+", seg.lower())
+        if sum(1 for t in toks if t in _EN_STOP) >= 3:
+            candidates.append((m.start(), m.end()))
+    return candidates
+
+def _apply_runs_replace(soup, text_node: NavigableString, actions):
+    """
+    Bytt *hele* tekstnoden i én operasjon:
+      actions = liste av dicts med:
+        {"start": int, "end": int, "kind": "wrap", "lang": "xx"} eller
+        {"start": int, "end": int, "kind": "flag", "base": "no"}
+    Forutsetter ikke-overlappende, sortert stigende på start.
+    """
+    if not isinstance(text_node, NavigableString):
+        return False
+    parent = text_node.parent
+    if not isinstance(parent, Tag):
+        return False
+
+    s = str(text_node)
+    if not s:
+        return False
+
+    actions = sorted(actions, key=lambda a: a["start"])
+    new_nodes = []
+    pos = 0
+
+    for a in actions:
+        st, en = a["start"], a["end"]
+        if st > pos:
+            chunk = s[pos:st]
+            if chunk:
+                new_nodes.append(NavigableString(chunk))
+
+        mid = s[st:en]
+        if not mid:
+            continue
+
+        if a["kind"] == "wrap":
+            span = soup.new_tag("span")
+            span["xml:lang"] = a["lang"]
+            span.append(NavigableString(mid))
+            new_nodes.append(span)
+        else:  # flag
+            span = soup.new_tag("span")
+            span["data-llm-pending"] = "lang-inline"
+            span["data-base-lang"] = a.get("base") or ""
+            sample = mid.strip()
+            if len(sample) > 160:
+                sample = sample[:157] + "…"
+            span["data-sample"] = sample
+            span.append(NavigableString(mid))
+            new_nodes.append(span)
+
+        pos = en
+
+    if pos < len(s):
+        tail = s[pos:]
+        if tail:
+            new_nodes.append(NavigableString(tail))
+
+    # Erstatt i parent (én gang)
+    try:
+        text_node.replace_with(new_nodes[0])
+    except Exception:
+        return False
+
+    cur = new_nodes[0]
+    for nn in new_nodes[1:]:
+        cur.insert_after(nn)
+        cur = nn
+
+    return True
+
 # =============== APPLY REQUIREMENTS ================
 
 def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
@@ -13960,43 +14121,66 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     logger.info("2.14 - Done. Normalized=%d, flagged_for_llm=%d", normalized, flagged)
 
 
-    '''
-
     # 2.15 Inline language markup
-    word_limit  = 4 # Single word tests are too insecure
-    languages   = {}
+    if not getattr(args, "detect_languages", False):
+        logger.info("2.15 - Inline language markup (disabled by --detect-languages)")
+    else:
+        logger.info("2.15 - Inline language markup")
+        base_lang = _doc_lang(soup)
+        auto_wrapped = 0
+        llm_flagged  = 0
 
-    languages[soup.html['lang']] = spacy.load(LANGUAGE_MODELS[soup.html['lang']])
-    languages[soup.html['lang']].add_pipe('language_detector')
+        for tn in list(soup.find_all(string=True)):
+            if _should_skip_textnode(tn):
+                continue
 
-    # This must be done first to establish given languages
-    for tag in soup(attrs={'lang':True}):
-        if tag['lang'] not in languages.keys():
-            languages[tag['lang']] = spacy.load(nordic.language_models[tag['lang']])
-            languages[tag['lang']].add_pipe('language_detector')
+            # Hvis nærmeste container allerede har lang/xml:lang → anse som korrekt markert.
+            if _parent_has_lang(tn):
+                continue
 
-    for tag in soup(string=True):
-        if (string := str(tag.string).strip()):
-            parent_tag  = None
-            language    = soup.html['lang']
+            s = str(tn)
+            if not s or s.isspace():
+                continue
 
-            for parent in list(tag.parents)[:-3]: # body, html and [document] should not be altered
-                if 'lang' in parent.attrs.keys():
-                    language = parent['lang']
-                    break
+            # Finn ikke-latinske skriptkjøringer
+            nonlatin_runs = _find_script_runs(s)
 
-            if len(str(tag.string).split(' ')) > word_limit:
-                doc = languages[language](str(tag.string))
-                if language != doc._.language: # TODO: and not {language, doc._.language} == {'nb', 'no'}:
-                    if doc._.language in languages.keys():
-                        if parent == tag.parent:
-                            parent['lang'] = doc._.language
-                        else:
-                            tag.parent['lang'] = doc._.language
+            # Bygg actions for én samlet erstatning
+            actions = []
+            # 1) wrap ikke-latin
+            for st, en, lang in nonlatin_runs:
+                # hvis nærmeste etablerte språk allerede samsvarer, hopp
+                if _closest_lang(tn, base_lang).startswith(lang):
+                    continue
+                actions.append({"start": st, "end": en, "kind": "wrap", "lang": lang})
 
-    # TODO: detect unspecified languages
+            # 2) (valgfrtt) flagg latin-engelsk-kandidater for LLM
+            if getattr(args, "llm", False):
+                latin_runs = _find_latin_englishish_runs(s, min_len=12)
+                if latin_runs:
+                    # unngå overlapping med wrap-områder
+                    def overlaps(a, b):
+                        return not (a[1] <= b[0] or b[1] <= a[0])
 
-    '''
+                    filtered = []
+                    for st, en in latin_runs:
+                        if any(overlaps((st, en), (x["start"], x["end"])) for x in actions):
+                            continue
+                        filtered.append((st, en))
+                    for st, en in filtered:
+                        actions.append({"start": st, "end": en, "kind": "flag", "base": _closest_lang(tn, base_lang)})
+
+            if not actions:
+                continue
+
+            # Sortér og anvend i én erstatning (unngår NoneType.parent-feilen)
+            actions.sort(key=lambda a: a["start"])
+            if _apply_runs_replace(soup, tn, actions):
+                auto_wrapped += sum(1 for a in actions if a["kind"] == "wrap")
+                llm_flagged  += sum(1 for a in actions if a["kind"] == "flag")
+
+        logger.info("2.15 - Done. Auto-wrapped (non-Latin)=%d, flagged_latin_candidates=%d",
+                    auto_wrapped, llm_flagged)
 
     # 2.16 Mathematics
     logger.info('2.16 - Mathematics')
@@ -14219,8 +14403,12 @@ def main():
                         help='Cleanup false play markup (remove wrong class="play", bogus speaker/directions).',
                         action='store_true')
     parser.add_argument('--table-normalize-cell-lists',
-        help='Normalize multi-item text inside table cells to <ul class="list-unstyled"> when safe.',
-        action='store_true')
+                        help='Normalize multi-item text inside table cells to <ul class="list-unstyled"> when safe.',
+                        action='store_true')
+    parser.add_argument('--detect-languages',
+                        dest='detect_languages',
+                        help='Auto-tag inline language/script changes (§2.15)',
+                        action='store_true')
 
     args = parser.parse_args()
     configure_logging(args.verbose)
