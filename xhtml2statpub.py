@@ -294,8 +294,10 @@ TASK_HEADINGS_RX = re.compile(
 
 # 2.1.3
 # Enkle mønstre
-_ACRONYM_RX = re.compile(r'^[A-ZÆØÅ]{2,}$')
-_ROMAN_RX   = re.compile(r'^(?i:M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3}))$')
+#_ACRONYM_RX = re.compile(r'^[A-ZÆØÅ]{2,}$')
+_ACRONYM_RX = re.compile(r'^[A-ZÆØÅ]{2,}([-/][A-ZÆØÅ]{2,})*$')
+#_ROMAN_RX   = re.compile(r'^(?i:M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3}))$')
+_ROMAN_RX = re.compile(r'^(?=[ivxlcdm]+[\.\)])[ivxlcdm]+[\.\)]$', re.I)
 # tokeniser: ord / mellomrom / annet
 _TOK_RX     = re.compile(r'([A-Za-zÆØÅæøå]+)|(\s+)|([^\sA-Za-zÆØÅæøå]+)')
 
@@ -314,7 +316,8 @@ _BLANK_MARKERS = {
 }
 
 # 2.1.6.2
-_SKIP_INSIDE = {"code", "pre", "math"}
+#_SKIP_INSIDE = {"code", "pre", "math"}
+_SKIP_INSIDE = {"code", "pre", "math", "kbd", "samp", "var"}
 
 # 2.1.6.3
 EOS_PUNCT_RX = re.compile(r'([.!?…]+)([)"»’\]\)]*)\s*$')  # punktum/utrop/spm/ellipser + evt. lukkere
@@ -326,11 +329,15 @@ _PUNCT_ONLY_RX = re.compile(r'^\s*[-–—·•.,;:!?…()\[\]{}"«»“”‘�
 _CONTENT_TAGS  = {"img","svg","math","table","code","kbd","samp","var","object","embed","canvas","audio","video","iframe","sup","sub","abbr"}
 
 # 2.1.6.5, 2.1.6.6
-_SKIP_INSIDE = {"code", "pre", "math", "kbd", "samp", "var"} # TODO: make _SKIP_TAGS
+#_SKIP_INSIDE = {"code", "pre", "math", "kbd", "samp", "var"} # TODO: make _SKIP_TAGS
 
 # 2.1.6.7
+#_FIGTEXT_CLASS_RX = re.compile(
+#    r'\b(?:fig(?:ure)?[-_ ]?(?:desc|text|caption)|image[-_ ]?(?:desc|text))\b',
+#    re.I
+#)
 _FIGTEXT_CLASS_RX = re.compile(
-    r'\b(?:fig(?:ure)?[-_ ]?(?:desc|text|caption)|image[-_ ]?(?:desc|text))\b',
+    r'\b(caption|legend|figure[-_ ]?text|fig[-_ ]?desc|image[-_ ]?(desc|text))\b',
     re.I
 )
 
@@ -1264,8 +1271,8 @@ def _iter_toc_containers(soup):
 
 # --- tekstnormalisering --------------------------------------------------------
 
-_ACRONYM_RX = re.compile(r'^[A-ZÆØÅ]{2,}$')
-_ROMAN_RX = re.compile(r'^(?i:M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3}))$')
+#_ACRONYM_RX = re.compile(r'^[A-ZÆØÅ]{2,}$')
+#_ROMAN_RX = re.compile(r'^(?i:M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3}))$')
 _LEADERS_RX = re.compile(r'[\.\u2022\u00B7·•…]+')  # ., bullets, middot, ellipsis, etc.
 
 def _is_acronym(tok: str) -> bool:
@@ -1883,7 +1890,8 @@ def _snippet(el, n=140):
 
 # --- Hjelpere for §2.1.11 ------------------------------------------------------
 
-_PROTECTED = {"pre", "code", "math", "script", "style", "textarea"}
+#_PROTECTED = {"pre", "code", "math", "script", "style", "textarea"}
+_PROTECTED = {"code", "pre", "math", "kbd", "samp", "var"}
 
 def _in_list_context(node):
     # Tillat <br> hvis den ligger i <li>/<dt>/<dd> (uansett om det er ol/ul/dl)
@@ -1913,7 +1921,7 @@ def _needs_space_around(br):
 
 # --- Hjelpere for §2.1.11 ------------------------------------------------------
 
-_PROTECTED = {"pre", "code", "math", "script", "style", "textarea"}
+#_PROTECTED = {"pre", "code", "math", "script", "style", "textarea"}
 _ALNUM_RX = re.compile(r'\w', re.UNICODE)
 
 def _in_protected(node):
@@ -1984,7 +1992,7 @@ def _collapse_adjacent_brs(parent):
 # --- Hjelpere for §2.1.12 ------------------------------------------------------
 
 # Kontekster vi ikke vil analysere
-_PROTECTED = {"code", "pre", "math", "script", "style", "textarea", "kbd", "samp", "var"}
+#_PROTECTED = {"code", "pre", "math", "script", "style", "textarea", "kbd", "samp", "var"}
 
 # Tokenisering (norsk + tall)
 _TOKEN_RX = re.compile(r"[A-Za-zÆØÅæøå0-9]+", re.UNICODE)
@@ -2230,11 +2238,23 @@ _ALLOWED_ALTS = {"photo","illustration","figure","symbol","map","drawing","comic
 
 # Norske + ENG nøkkelord
 LOGO_RX  = re.compile(r'\b(logo|logotype|brandmark)\b', re.I)
-MAP_RX   = re.compile(r'\b(map|kart)\b', re.I)
+#MAP_RX   = re.compile(r'\b(map|kart)\b', re.I)
+MAP_RX = re.compile(
+    r'\b(map|kart|oversiktskart|atlas|globe|verdenskart|rutekart|områdekart|plan|plankart)\b',
+    re.I
+)
 ICON_RX  = re.compile(r'\b(icon|symbol|glyph|bullet|favicon|btn|button|arrow|chevron|caret|social|nav|menu)\b', re.I)
-COMIC_RX = re.compile(r'\b(comic|strip|panel|rute)\b', re.I)
+#COMIC_RX = re.compile(r'\b(comic|strip|panel|rute)\b', re.I)
+COMIC_RX = re.compile(
+    r'\b(comic|panel|strip|frame|speech\s*bubble|speechballoon|balloon)\b',
+    re.I
+)
 DRAW_RX  = re.compile(r'\b(drawing|sketch|tegning|teikning)\b', re.I)
-PHOTO_RX = re.compile(r'\b(photo|photograph|foto|portrait|portrett)\b', re.I)
+#PHOTO_RX = re.compile(r'\b(photo|photograph|foto|portrait|portrett)\b', re.I)
+PHOTO_RX = re.compile(
+    r'\b(foto|photograph|photo|bilde|bilete|image|illustrasjon|illustration|portrett|portrait)\b',
+    re.I
+)
 FIG_RX   = re.compile(r'\b(figure|diagram|graph|chart|plot|model|modell|schema|schematic|flow|kurve)\b', re.I)
 ILL_RX   = re.compile(r'\b(illustration|illustrasjon|illustrasjoner|illustrasjonar)\b', re.I)
 
@@ -2377,8 +2397,8 @@ def _tokens_for_image(img):
         p = p.parent; hops += 1
     return " ".join(toks).lower()
 
-PHOTO_RX = re.compile(r'\b(photo|photograph|foto|portrait|portrett)\b', re.I)
-MAP_RX   = re.compile(r'\b(map|kart)\b', re.I)
+#PHOTO_RX = re.compile(r'\b(photo|photograph|foto|portrait|portrett)\b', re.I)
+#MAP_RX   = re.compile(r'\b(map|kart)\b', re.I)
 GRAPH_RX = re.compile(r'\b(graph|chart|plot|diagram|kurve|søyle|linje(?:diagram)?|sektor(?:diagram)?)\b', re.I)
 WEB_RX   = re.compile(r'\b(screenshot|screen[-_ ]?shot|web(?:page|side)?|nett[ -]?side|browser|url)\b', re.I)
 BOOK_RX  = re.compile(r'\b(scan|scanned|page[-_ ]?scan|book[-_ ]?page|bokside|facsimile|faksimile)\b', re.I)
@@ -2564,7 +2584,7 @@ def _resolve_image_path(src: str, base_dir: str) -> str | None:
 # --- Hjelpere for §2.3.3 ------------------------------------------------------
 
 # Gjenkjenner typiske “figur-tekst”-containere (ikke <figcaption>)
-_FIGTEXT_CLASS_RX = re.compile(r'\bfig(?:ure)?[-_ ]?(?:desc|text)\b', re.I)
+#_FIGTEXT_CLASS_RX = re.compile(r'\bfig(?:ure)?[-_ ]?(?:desc|text)\b', re.I)
 
 def _is_fig_text_container(el) -> bool:
     if not getattr(el, "name", None):
@@ -2587,8 +2607,13 @@ def _next_significant_sibling(node):
 
 # --- Hjelpere for §2.3.4 ------------------------------------------------------
 
-_BLOCKY = {"ul", "ol", "table", "div", "section", "aside", "dl", "figure"}
-_PROTECTED = {"pre", "code", "math", "script", "style", "textarea"}
+#_BLOCKY = {"ul", "ol", "table", "div", "section", "aside", "dl", "figure"}
+_BLOCKY = {
+    "p", "div", "section", "article", "aside", "figure",
+    "header", "footer", "nav", "table", "ul", "ol", "dl", "blockquote",
+    "main", "pre", "form", "details", "summary"
+}
+#_PROTECTED = {"pre", "code", "math", "script", "style", "textarea"}
 
 def _in_protected(node):
     p = node
@@ -2600,7 +2625,8 @@ def _in_protected(node):
 
 # --- Hjelpere for §2.3.5 ------------------------------------------------------
 
-_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
+#_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
+_HEADING_RX = re.compile(r'^h([1-6])$', re.I)
 TASK_TOKENS = {
     "assessment","assessments",
     "exercise","exercises",
@@ -2649,7 +2675,7 @@ def _in_task_ancestor(node):
 
 # --- Hjelpere for §2.3.4 ------------------------------------------------------
 
-_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
+#_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
 
 def _is_pagebreak(el):
     return getattr(el, "name", "") == "div" and (el.get("epub:type") or "").lower() == "pagebreak"
@@ -2817,7 +2843,7 @@ def _resolve_image_path(src: str, base_dir: str | None) -> str | None:
 # --- Hjelpere for §2.3.8 ------------------------------------------------------
 
 # Heuristikk: ord som sannsynligvis markerer tegneserie
-COMIC_RX = re.compile(r'\b(comic|panel|strip|graphic|manga|manhua|manhwa|teikneserie|tegn(?:e)?serie)\b', re.I)
+#COMIC_RX = re.compile(r'\b(comic|panel|strip|graphic|manga|manhua|manhwa|teikneserie|tegn(?:e)?serie)\b', re.I)
 
 def _tokens_for_img(img):
     toks = []
@@ -2883,8 +2909,9 @@ def _text_to_paragraphs(parent, soup, text: str):
 
 # --- Hjelpere for §2.4.1 ------------------------------------------------------
 
-_ROMAN_RX = re.compile(r'^(?=[IVXLCDM]+$)M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$')
-_PUNCT_RX = r'[.\)\:\-\u00A0]'  # godta . ) : - NBSP som skilletegn
+#_ROMAN_RX = re.compile(r'^(?=[IVXLCDM]+$)M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$')
+_PUNCT_RX = re.compile(r'([.!?])$')
+#_PUNCT_RX = r'[.\)\:\-\u00A0]'  # godta . ) : - NBSP som skilletegn
 
 def _roman_to_int(s: str) -> int | None:
     m = _ROMAN_RX.match(s.upper())
@@ -2978,7 +3005,7 @@ def _detect_series(tokens: list[str]) -> tuple[str,int,bool] | None:
 
 # --- Hjelpere for §2.4.1.1 ------------------------------------------------------
 
-_PUNCT_RX = r'[.\)\:\-\u00A0]'  # punkt/parentes/kolon/minus/NBSP som typiske markør-skilletegn
+#_PUNCT_RX = r'[.\)\:\-\u00A0]'  # punkt/parentes/kolon/minus/NBSP som typiske markør-skilletegn
 _WIDE_RX = re.compile(rf'^\s*([0-9]+|[A-Za-z]|[ivxlcdmIVXLCDM]+)\s*(?:{_PUNCT_RX}+)?\s+')
 
 _ROMAN_VALID_RX = re.compile(r'^(?=[IVXLCDM]+$)M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$')
@@ -3351,8 +3378,8 @@ def _normalize_plain_ul(ul) -> bool:
 # --- Hjelpere for §2.4.3 ------------------------------------------------------
 
 # Blokk-typer som gjør at vi lar <p> stå i <li> (særlig nested lists)
-_BLOCKY = {"ul", "ol", "table", "figure", "blockquote", "section",
-           "aside", "dl", "pre", "math"}
+#_BLOCKY = {"ul", "ol", "table", "figure", "blockquote", "section",
+#           "aside", "dl", "pre", "math"}
 
 def _has_block_children(li) -> bool:
     for child in li.find_all(recursive=False):
@@ -3376,7 +3403,7 @@ _GLOSSARY_TITLES = {
     "no": "Ordforklaringer",
 }
 
-_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
+#_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
 
 def _doc_lang(soup) -> str:
     html = getattr(soup, "html", None)
@@ -3569,8 +3596,15 @@ def _insert_ipa_before_trailing_colon(dt, ipa_slash: str) -> bool:
         return True
 
 # --- Hjelpere for §2.4.4.2 ------------------------------------------------------
-_TASK_TOKENS = {"assessment", "exercise", "task", "practice"}  # utvid ved behov
-_HEADING_RX  = re.compile(r"^h([1-6])$", re.I)
+#_TASK_TOKENS = {"assessment", "exercise", "task", "practice"}  # utvid ved behov
+_TASK_TOKENS = {
+    "assessment", "assessments",
+    "exercise", "exercises",
+    "practice",
+    "task", "tasks",
+    "fill-in-the-blank-problem",
+}
+#_HEADING_RX  = re.compile(r"^h([1-6])$", re.I)
 
 def _doc_lang(soup) -> str:
     html = getattr(soup, "html", None)
@@ -3730,8 +3764,9 @@ def _ensure_page_group(container: Tag, page_label: str, sub_level: int, lang: st
 
 # --- Hjelpere for §2.5.1.1 ------------------------------------------------------
 
-_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
-_TASK_TOKENS   = {"assessment", "exercise", "exercises", "practice", "task", "tasks"}
+#_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
+#_TASK_TOKENS   = {"assessment", "exercise", "exercises", "practice", "task", "tasks"}
+#_ANSWER_TOKENS = {"answer", "answers", "solution", "solutions", "fasit"}
 _ANSWER_TOKENS = {"answer", "answers", "solution", "solutions", "fasit"}
 
 def _doc_lang(soup) -> str:
@@ -3805,12 +3840,12 @@ def _count_immediate_task_children(sec: Tag) -> int:
 
 # --- Hjelpere for §2.5.1.2 ------------------------------------------------------
 
-_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
-_TASK_TOKENS   = {"assessment", "exercise", "exercises", "practice", "task", "tasks"}
-_ANSWER_TOKENS = {"answer", "answers", "solution", "solutions", "fasit"}
+#_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
+#_TASK_TOKENS   = {"assessment", "exercise", "exercises", "practice", "task", "tasks"}
+#_ANSWER_TOKENS = {"answer", "answers", "solution", "solutions", "fasit"}
 
 # Hva teller som "komplekst" innhold inni en oppgave <li>:
-_BLOCKY = {"section", "article", "aside", "figure", "table", "dl", "pre", "math", "blockquote"}
+#_BLOCKY = {"section", "article", "aside", "figure", "table", "dl", "pre", "math", "blockquote"}
 # NB: ul/ol håndteres eksplisitt (nested lists)
 
 def _doc_lang(soup) -> str:
@@ -3971,11 +4006,11 @@ def _ensure_heading_in_li(li: Tag, level: int, label: str, number: int | None, l
 
 # --- Hjelpere for §2.5.1.3 ------------------------------------------------------
 
-_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
-_TASK_TOKENS   = {"assessment", "exercise", "exercises", "practice", "task", "tasks"}
-_ANSWER_TOKENS = {"answer", "answers", "solution", "solutions", "fasit"}
+#_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
+#_TASK_TOKENS   = {"assessment", "exercise", "exercises", "practice", "task", "tasks"}
+#_ANSWER_TOKENS = {"answer", "answers", "solution", "solutions", "fasit"}
 
-_BLOCKY = {"section", "article", "aside", "figure", "table", "dl", "pre", "math", "blockquote"}
+#_BLOCKY = {"section", "article", "aside", "figure", "table", "dl", "pre", "math", "blockquote"}
 
 def _doc_lang(soup) -> str:
     html = getattr(soup, "html", None)
@@ -4140,9 +4175,9 @@ def _ensure_heading_in_li(li: Tag, level: int, text: str) -> bool:
     return True
 
 # --- Hjelpere for §2.5.1.3 ------------------------------------------------------
-_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
-_TASK_TOKENS   = {"assessment", "exercise", "exercises", "practice", "task", "tasks"}
-_ANSWER_TOKENS = {"answer", "answers", "solution", "solutions", "fasit"}
+#_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
+#_TASK_TOKENS   = {"assessment", "exercise", "exercises", "practice", "task", "tasks"}
+#_ANSWER_TOKENS = {"answer", "answers", "solution", "solutions", "fasit"}
 
 def _epub_types(el: Tag) -> set[str]:
     raw = (el.get("epub:type") or "")
@@ -4195,7 +4230,7 @@ def _ensure_aria_labelledby(section: Tag, heading: Tag):
 
 # --- Hjelpere for §2.5.1.3 ------------------------------------------------------
 
-_TASK_TOKENS = {"assessment", "exercise", "exercises", "practice", "task", "tasks"}
+#_TASK_TOKENS = {"assessment", "exercise", "exercises", "practice", "task", "tasks"}
 _GENERIC_ALT = {"symbol", "ikon", "oppgavesymbol", "task symbol", "icon"}  # kan utvides
 
 def _epub_types(el: Tag) -> set[str]:
@@ -4351,7 +4386,7 @@ def _already_replaced(img: Tag) -> bool:
 # --- Hjelpere for §2.5.1.6 ------------------------------------------------------
 
 _MATCH_TOKENS = {"match-problem"}  # kan utvides: {"match-problem","matching","pairing"}
-_HEADING_RX   = re.compile(r"^h([1-6])$", re.I)
+#_HEADING_RX   = re.compile(r"^h([1-6])$", re.I)
 
 def _epub_types(el: Tag) -> set[str]:
     raw = (el.get("epub:type") or "")
@@ -4469,12 +4504,13 @@ def _convert_table_to_two_lists(tbl: Tag, soup, lang: str, logger) -> tuple[Tag,
 
 # --- Hjelpere for §2.5.1.7 ------------------------------------------------------
 # Tomme bokser / figurer som ofte brukes for blanks
-_BOX_CHARS = r"□☐⬜◻▢▯⎕"
+#_BOX_CHARS = r"□☐⬜◻▢▯⎕"
+_BOX_CHARS = "□☐⬜◻▢▯⎕"
 BOX_RX     = re.compile(rf"[{_BOX_CHARS}]+")
 ELLIPSIS_RX = re.compile(r"(…+|\.\s?\.\s?\.\s?(?:\.\s?)*)")  # '…' eller '...' med/uten mellomrom, 3+ dots → '....'
 
 # Vi vil bare jobbe i task-kontekst
-_TASK_TOKENS = {"assessment", "exercise", "exercises", "practice", "task", "tasks", "fill-in-the-blank-problem"}
+#_TASK_TOKENS = {"assessment", "exercise", "exercises", "practice", "task", "tasks", "fill-in-the-blank-problem"}
 
 # Skip disse: ikke gjør teksttransformasjoner inni
 _SKIP_CONTAINERS = {"math", "pre", "code", "figure"}
@@ -4538,7 +4574,7 @@ _BLANK_SENTENCE_RX = re.compile(r"(?:_{2,}|\.{4,}|…)", re.UNICODE)  # matcher 
 _WORD_SPLIT_RX     = re.compile(r"[;,/]|(?:\s{2,})")                # delere for “gitt ord”
 _PARENS_BLOCK_RX   = re.compile(r"\((.*?)\)\s*$")                   # parentes på slutten av tekst
 
-_TASK_TOKENS = {"assessment", "exercise", "exercises", "practice", "task", "tasks", "fill-in-the-blank-problem"}
+#_TASK_TOKENS = {"assessment", "exercise", "exercises", "practice", "task", "tasks", "fill-in-the-blank-problem"}
 
 def _epub_types(el: Tag) -> set[str]:
     raw = (el.get("epub:type") or "")
@@ -4654,11 +4690,11 @@ def _neutralize_answer(answer_el: Tag):
 
 # --- Hjelpere for §2.5.1.9 ------------------------------------------------------
 # Gjenbrukbare tokens
-_TASK_TOKENS = {"assessment", "exercise", "exercises", "practice", "task", "tasks"}
+#_TASK_TOKENS = {"assessment", "exercise", "exercises", "practice", "task", "tasks"}
 _FILL_TOKENS = {"fill-in-the-blank-problem"}
 
 # Tegn som ofte brukes som "linjer"
-_BOX_CHARS = "□☐⬜◻▢▯⎕"
+#_BOX_CHARS = "□☐⬜◻▢▯⎕"
 
 # Det vi anser som "linjer" helt på slutten av en blokk (ikke ord-blank '....')
 TRAILING_LINE_RX = re.compile(
@@ -4769,7 +4805,7 @@ def _convert_2col_table_to_question_list(tbl: Tag, soup, logger) -> bool:
 # --- Hjelpere for §2.5.1.10 ------------------------------------------------------
 
 _CROSSWORD_TOKENS = {"crossword", "puzzle-crossword", "crossword-puzzle"}
-_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
+#_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
 
 def _epub_types(el: Tag) -> set[str]:
     raw = (el.get("epub:type") or "")
@@ -5777,7 +5813,7 @@ _TASKISH_TOKENS = {
 }
 _ANSWERISH_TOKENS = {"answer","answers","key","fasit"}
 
-_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
+#_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
 
 def _epub_types(el: Tag) -> set[str]:
     t = (el.get("epub:type") or "").lower()
@@ -5955,7 +5991,7 @@ def _ensure_heading_in_section(sec: Tag, label: str, soup):
 
 # tillatte “ramme”-klasser
 _FRAME_ALLOWED = {"generisk-ramme", "ramme", "bg-red", "bg-blue", "bg-yellow", "bg-gray", "bg-beige"}
-_HEADING_RX    = re.compile(r"^h([1-6])$", re.I)
+#_HEADING_RX    = re.compile(r"^h([1-6])$", re.I)
 
 def _epub_types(el: Tag) -> set[str]:
     t = (el.get("epub:type") or "").lower()
@@ -6023,7 +6059,7 @@ def _skip_aside(aside: Tag) -> bool:
 
 # --- Hjelpere for 2.6.1 ----------------------------------------------------
 
-_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
+#_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
 
 def _skip_math_aside(aside: Tag) -> bool:
     """Skipp prodnote/fig-desc/glossary/desc-lister som ikke skal konverteres her."""
@@ -6080,7 +6116,7 @@ _MARGIN_TYPE_TOKENS = {"annotation", "marginalia", "sidebar", "note", "comment"}
 # Oppgave-/fasitmarkører vi vil stoppe før når vi plasserer listen
 _TASKISH_TOKENS = {"assessment","assessments","exercise","exercises","practice","task","tasks"}
 
-_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
+#_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
 
 def _tokenize_types(val: str) -> set[str]:
     return set((val or "").lower().replace(";", " ").replace(",", " ").split())
@@ -6659,7 +6695,7 @@ def _move_pagebreak_to_block_level(pb: Tag):
 
 # --- Hjelpere for § 2.9.1 -----------------------------------------------------
 
-_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
+#_HEADING_RX = re.compile(r"^h([1-6])$", re.I)
 
 def _first_sig_child(tag: Tag):
     for c in tag.contents:
@@ -7047,7 +7083,7 @@ def _collapse_consecutive_br(cell):
 
 _BULLET_CHARS = "•●○–—\\-▪■‣∙·*‒•"  # utvidbar
 _BULLET_RX = re.compile(rf"^\s*([{_BULLET_CHARS}]+)\s+")
-_ROMAN_RX  = re.compile(r"^\s*[ivxlcdm]+\s*[\)\.]?\s*", re.I)  # iv)  ix.  etc.
+#_ROMAN_RX  = re.compile(r"^\s*[ivxlcdm]+\s*[\)\.]?\s*", re.I)  # iv)  ix.  etc.
 _ALPHA_RX  = re.compile(r"^\s*[a-z]\s*[\)\.]?\s*", re.I)       # a)  b.  etc.
 
 def _has_math(tag):
