@@ -294,7 +294,7 @@ LANGUAGE_MODELS = {
 # RX
 
 
-
+_BOX_CHARS = "□☐⬜◻▢▯⎕"
 _ACRONYM_RX = re.compile(r'^[A-ZÆØÅ]{2,}([-/][A-ZÆØÅ]{2,})*$')
 _ALNUM_RX = re.compile(r'\w', re.UNICODE)
 _ALPHA_TYPE_RX = re.compile(r'^[aA]$')
@@ -626,7 +626,7 @@ _GLOSSARY_TITLES = {
 }
 _GENERIC_ALT = {"symbol", "ikon", "oppgavesymbol", "task symbol", "icon"}  # kan utvides
 _MATCH_TOKENS = {"match-problem"}  # kan utvides: {"match-problem","matching","pairing"}
-_BOX_CHARS = "□☐⬜◻▢▯⎕"
+
 BOARD_CLASS_HINTS = {"boardgame", "board-game", "gameboard", "game-board"}
 BOX_CLASS_HINTS   = {"box", "tile", "square", "space", "cell"}
 _CHECK_GLYPHS = set("☐☑☒✓✔✗✘")
