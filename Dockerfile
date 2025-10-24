@@ -45,5 +45,5 @@ COPY . .
 RUN useradd -m -u 10001 appuser && chown -R appuser:appuser /app /usr/local/share/nltk_data
 USER appuser
 
-EXPOSE 9002
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "9002"]
+EXPOSE 39005
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "39005"]
