@@ -1,30 +1,57 @@
-# --- Web API ---
-fastapi>=0.110,<1.0
-uvicorn[standard]>=0.29,<0.33
-python-multipart>=0.0.18
-
-# --- XHTML/XML parsing & transformasjoner ---
-beautifulsoup4>=4.12.3,<5.0
-lxml>=5.2.1,<6.0
-
-# --- NLP / språk ---
-nltk>=3.9.1,<4.0
+aio-pika==9.5.7
+aiormq==6.9.0
+annotated-types==0.7.0
+anyio==4.11.0
+beautifulsoup4==4.14.2
+certifi==2025.10.5
+click==8.3.0
+contourpy==1.3.3
+cycler==0.12.1
+epubcheck==5.1.0
+fastapi==0.119.0
+fonttools==4.60.1
+h11==0.16.0
+httpcore==1.0.9
+httptools==0.7.1
+httpx==0.28.1
+idna==3.11
 ipapy==0.0.9.0
-
-# --- Tall / data / plotting (importert i koden) ---
-numpy>=2.0,<3.0
-pandas>=2.2,<3.0
-matplotlib>=3.8,<4.0
-
-# --- Bildebehandling / OCR ---
-pillow>=10.3,<11.0
-pytesseract>=0.3.10,<0.4.0
-# Merk: pytesseract krever systempakken "tesseract-ocr" (apt/apk/yum) installert i imaget.
-
-# --- EPUB validering ---
-epubcheck
-# Merk: Python-pakken "epubcheck" bruker som regel Java under panseret; sørg for at Java/JRE finnes i imaget.
-
-# --- LLM ---
-pika>=1.3,<2
-
+joblib==1.5.2
+kiwisolver==1.4.9
+lxml==5.4.0
+matplotlib==3.10.7
+multidict==6.7.0
+nltk==3.9.2
+numpy==2.3.3
+packaging==25.0
+pamqp==3.3.0
+pandas==2.3.3
+pika==1.3.2
+pillow==10.4.0
+propcache==0.4.1
+pydantic==2.12.2
+pydantic_core==2.41.4
+pyparsing==3.2.5
+pytesseract==0.3.13
+python-dateutil==2.9.0.post0
+python-dotenv==1.1.1
+python-multipart==0.0.20
+pytz==2025.2
+PyYAML==6.0.3
+regex==2025.9.18
+six==1.17.0
+sniffio==1.3.1
+soupsieve==2.8
+starlette==0.48.0
+tablib==3.8.0
+tqdm==4.67.1
+typing-inspection==0.4.2
+typing_extensions==4.15.0
+tzdata==2025.2
+uvicorn==0.32.1
+uvloop==0.21.0
+watchfiles==1.1.1
+websockets==15.0.1
+xlrd==2.0.2
+xlwt==1.3.0
+yarl==1.22.0
