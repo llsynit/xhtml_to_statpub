@@ -31,7 +31,7 @@ from collections    import Counter
 from urllib.parse   import urlparse, unquote
 from datetime       import datetime
 
-import unicodedata, string, re, nltk, subprocess #spacy, cv2, json, uuid
+import sys, unicodedata, string, re, nltk, subprocess #spacy, cv2, json, uuid
 
 import xml.etree.ElementTree    as ET
 import numpy                    as np
@@ -14075,16 +14075,16 @@ def run_xslt(input_xml, stylesheet, output_xml, logger):
 # def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 def convert(args, logger):
     # Les fil og parse som XML/XHTML
-    data = await file.read()
     try:
-        soup = BeautifulSoup(data, "xml")
+        soup = BeautifulSoup(args.data, "xml")
 
     except Exception:
         # fallback hvis 'xml'-parser ikke er tilgjengelig
-        soup = BeautifulSoup(data, "lxml-xml")
+        soup = BeautifulSoup(args.data, "lxml-xml")
 
-    soup = apply_requirements(soup, logger, folders, args)
-    reutnrn soup.prettify(formatter="minimal").encode("utf-8")
+    # TODO: move args.folders to args
+    soup = apply_requirements(soup, logger, args.folders, args)
+    return soup.prettify(formatter="minimal").encode("utf-8")
 
 def convert02(args, logger):
     #production_number = Path(file).stem

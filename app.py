@@ -1,4 +1,5 @@
 from __future__ import annotations
+import sys
 import os
 import uuid
 import tempfile
@@ -195,11 +196,11 @@ async def run(
     job_id = f"{production_number}-{timestamp}"
     job_dir = ARTIFACTS_ROOT / job_id
     logger.info(f"Job dir: {job_dir}")
+    data = await file.read()
 
     # MOVED TO xhtml_to_statpub.py
     '''
     # Les fil og parse som XML/XHTML
-    data = await file.read()
     try:
         soup = BeautifulSoup(data, "xml")
     except Exception:
@@ -211,6 +212,7 @@ async def run(
     args = SimpleNamespace(
         file=file,
         folders=folders,
+        data=data,
         mathematics=bool(mathematics),
         science=bool(science),
         grade=(int(grade) if grade is not None and str(grade).strip() != "" else None),
