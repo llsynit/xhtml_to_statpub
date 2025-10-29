@@ -14072,7 +14072,21 @@ def run_xslt(input_xml, stylesheet, output_xml, logger):
     except subprocess.CalledProcessError as e:
         print("XSLT transformation failed:", e)
 
+# def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 def convert(args, logger):
+    # Les fil og parse som XML/XHTML
+    data = await file.read()
+    try:
+        soup = BeautifulSoup(data, "xml")
+
+    except Exception:
+        # fallback hvis 'xml'-parser ikke er tilgjengelig
+        soup = BeautifulSoup(data, "lxml-xml")
+
+    soup = apply_requirements(soup, logger, folders, args)
+    reutnrn soup.prettify(formatter="minimal").encode("utf-8")
+
+def convert02(args, logger):
     #production_number = Path(file).stem
     #if not production_number:
     production_number   = path.splitext(path.basename(args.input))[0]
