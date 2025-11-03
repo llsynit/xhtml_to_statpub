@@ -29,8 +29,9 @@ from pika           import BlockingConnection, ConnectionParameters, PlainCreden
 from time           import sleep, time
 from collections    import Counter
 from urllib.parse   import urlparse, unquote
+from datetime       import datetime
 
-import unicodedata, string, re, nltk, subprocess #spacy, cv2, json, uuid
+import sys, unicodedata, string, re, nltk, subprocess #spacy, cv2, json, uuid
 
 import xml.etree.ElementTree    as ET
 import numpy                    as np
@@ -93,6 +94,10 @@ xslt_file = 'html-to-nav.xsl'
 
 # CONSTANTS
 # =========
+
+BASE_DIR = Path(__file__).parent
+ARTIFACTS_ROOT = (BASE_DIR / "artifacts").resolve()
+ARTIFACTS_ROOT.mkdir(parents=True, exist_ok=True)
 
 TMP_DIR     = path.join(path.dirname(path.abspath(__file__)), 'tmp')
 STATIC_DIR  = path.join(path.dirname(path.abspath(__file__)), 'static')
@@ -294,7 +299,7 @@ LANGUAGE_MODELS = {
 # RX
 
 
-_BOX_CHARS = "□☐⬜◻▢▯⎕"
+
 _ACRONYM_RX = re.compile(r'^[A-ZÆØÅ]{2,}([-/][A-ZÆØÅ]{2,})*$')
 _ALNUM_RX = re.compile(r'\w', re.UNICODE)
 _ALPHA_TYPE_RX = re.compile(r'^[aA]$')
@@ -303,7 +308,10 @@ ANSWER_HEAD_RX = re.compile(r'\b(fasit|svar|løysings?-?forslag|solutions?|answe
 _ANSWER_RX = re.compile(r'\banswer(s)?\b', re.I)  # epub:type ~ "answer" / "answers"
 _BLANK_SENTENCE_RX = re.compile(r"(?:_{2,}|\.{4,}|…)", re.UNICODE)  # matcher __, ...., … (fra §2.5.1.7)
 BOOK_RX  = re.compile(r'\b(scan|scanned|page[-_ ]?scan|book[-_ ]?page|bokside|facsimile|faksimile)\b', re.I)
+_BOX_CHARS = "□☐⬜◻▢▯⎕"
 BOX_RX     = re.compile(rf"[{_BOX_CHARS}]+")
+_BULLET_CHARS = "•◦·●○■□◆◇▸▶►▹▻▪▫–—-"  # inkl. ASCII '-' og en-/emdash
+_BULLET_CHARS = "•●○–—\\-▪■‣∙·*‒•"  # utvidbar
 _BULLET_PREFIX_RX = re.compile(rf'^\s*([{_BULLET_CHARS}]+)\s+')
 COMIC_RX = re.compile(r'\b(comic|panel|strip|frame|speech\s*bubble|speechballoon|balloon|rute)\b',re.I)
 #COMIC_RX = re.compile(r'\b(comic|panel|strip|graphic|manga|manhua|manhwa|teikneserie|tegn(?:e)?serie)\b', re.I)
@@ -426,11 +434,6 @@ _BLOCKY = {
     "p", "div", "section", "article", "aside", "figure",
     "header", "footer", "nav", "table", "ul", "ol", "dl", "blockquote",
     "main", "pre", "form", "details", "summary"
-}
-_BLOCK_TAGS = {
-    "address","article","aside","blockquote","caption","center","div","dl","dt","dd","figure","figcaption",
-    "footer","form","h1","h2","h3","h4","h5","h6","header","hr","li","main","nav","ol","p","pre","section",
-    "table","tbody","thead","tfoot","tr","td","th","ul","video","audio","canvas","math"
 }
 _BLOCK_TAGS = {
     "address","article","aside","blockquote","caption","center","div","dl","dt","dd","figure","figcaption",
@@ -615,8 +618,6 @@ _BAD_BLOCKS = {
     "section", "article", "details", "summary",
     "figure"  # nested figure
 }
-_BULLET_CHARS = "•◦·●○■□◆◇▸▶►▹▻▪▫–—-"  # inkl. ASCII '-' og en-/emdash
-_BULLET_CHARS = "•●○–—\\-▪■‣∙·*‒•"  # utvidbar
 _BULLET_RX = re.compile(rf"^\s*([{_BULLET_CHARS}]+)\s+")
 _GLOSSARY_TITLES = {
     "en": "Glossary",
@@ -626,7 +627,6 @@ _GLOSSARY_TITLES = {
 }
 _GENERIC_ALT = {"symbol", "ikon", "oppgavesymbol", "task symbol", "icon"}  # kan utvides
 _MATCH_TOKENS = {"match-problem"}  # kan utvides: {"match-problem","matching","pairing"}
-
 BOARD_CLASS_HINTS = {"boardgame", "board-game", "gameboard", "game-board"}
 BOX_CLASS_HINTS   = {"box", "tile", "square", "space", "cell"}
 _CHECK_GLYPHS = set("☐☑☒✓✔✗✘")
@@ -1000,34 +1000,30 @@ def figure_to_table(docs, soup, figure):
     except Exception as e: # work on python 3.x
         return None
 
-# --- Hjelpere for §2.1.2 ------------------------------------------------------
-
-# For 2.5.1.12
-def _looks_like_task_block(el):
-    # enkel språk-agnostisk sjekk
-    txt = (el.get_text(" ", strip=True) or "").lower()
-    return any(token in txt for token in ("oppgave", "oppgåve", "task", "exercise"))
-
-# For 2.5.1.12
-def _has_taskish_descendant(el):
-    return el.find(lambda t: getattr(t, "name", None) and _is_task_container(t)) is not None
-
+# --- Hjelpere ------------------------------------------------------
 def _find_next_pagebreak(el):
+    # 2.1.2
     return el.find_next(lambda x: getattr(x, "name", None) and _is_pagebreak(x))
 
-def _tag_moved_origin(node):
-    """Merk noden med hvilket 'segment' (høyre sidebryter) den opprinnelig lå foran."""
-    nxt = _find_next_pagebreak(node)
-    if nxt:
-        seg_id = nxt.get("id")
-        if seg_id:
-            node.attrs["data-moved-from-seg"] = seg_id
+def _find_task_anchor(container):
+    # 2.1.2
+    # Finn første forekomst av oppgave-seksjon inne i containeren
+    for el in container.descendants:
+        if getattr(el, "name", None) and _is_task_heading(el):
+            return el
+    return None
 
 def _get_text_snippet(tag, max_chars=240):
+    # 2.1.2
     txt = (tag.get_text(" ", strip=True) or "").strip()
     return (txt[:max_chars] + "…") if len(txt) > max_chars else txt
 
+def _has_taskish_descendant(el):
+    # 2.1.2
+    return el.find(lambda t: getattr(t, "name", None) and _is_task_container(t)) is not None
+
 def _is_task_heading(tag) -> bool:
+    # 2.1.2
     # Overskrifter som utløser "plassér før oppgaver"
     if tag.name and tag.name.lower() in ('h1','h2','h3','h4','h5','h6'):
         if TASK_HEADINGS_RX.search(tag.get_text(" ", strip=True) or ""):
@@ -1041,14 +1037,8 @@ def _is_task_heading(tag) -> bool:
         return True
     return False
 
-def _find_task_anchor(container):
-    # Finn første forekomst av oppgave-seksjon inne i containeren
-    for el in container.descendants:
-        if getattr(el, "name", None) and _is_task_heading(el):
-            return el
-    return None
-
 def _lift_to_container_level(container, node):
+    # 2.1.2
     """
     Når ankret ligger dypt, legger vi inn før "øverste" forfader som er direkte barn av container.
     """
@@ -1057,13 +1047,32 @@ def _lift_to_container_level(container, node):
         top = top.parent
     return top
 
+def _looks_like_task_block(el):
+    # 2.1.2
+    # enkel språk-agnostisk sjekk
+    txt = (el.get_text(" ", strip=True) or "").lower()
+    return any(token in txt for token in ("oppgave", "oppgåve", "task", "exercise"))
+
+def _tag_moved_origin(node):
+    # 2.1.2
+    """Merk noden med hvilket 'segment' (høyre sidebryter) den opprinnelig lå foran."""
+    nxt = _find_next_pagebreak(node)
+    if nxt:
+        seg_id = nxt.get("id")
+        if seg_id:
+            node.attrs["data-moved-from-seg"] = seg_id
+
+# --- Hjelpere ------------------------------------------------------
+
 def _is_glossary_container(tag):
+    # 2.1.2
     # Enten en <dl>, eller et element som inneholder en <dl>
     if tag.name and tag.name.lower() == "dl":
         return True
     return tag.find("dl") is not None
 
 def _iter_chapter_like_containers(soup):
+    # 2.1.2
     # Prøv først kapitler/sectioner – fall tilbake til <body>
     candidates = []
     for sec in soup.find_all(["section", "article"]):
@@ -1078,13 +1087,16 @@ def _iter_chapter_like_containers(soup):
 # --- Hjelpere for §2.1.3 ------------------------------------------------------
 
 def _is_acronym(tok: str) -> bool:
+    # 2.1.3
     return bool(_ACRONYM_RX.match(tok)) or bool(_ROMAN_RX.match(tok))
 
 def _collect_heading_text(head_tag):
+    # 2.1.3
     """Samle ren tekst av en heading (uten å fjerne inline-tagger) for ev. LLM."""
     return head_tag.get_text(" ", strip=True)
 
 def _llm_exceptions_for_heading(llm, logger, text: str):
+    # 2.1.3
     """
     Spør LLM (hvis aktiv) om hvilke 'tokens' i headingen som bør beholde opprinnelig
     kapitalisering (egennavn/brand). Returnerer et sett med streng-tokens.
@@ -1103,6 +1115,7 @@ def _llm_exceptions_for_heading(llm, logger, text: str):
         return set()
 
 def _transform_heading_text(raw: str, keep_tokens: set):
+    # 2.1.3
     """
     Gjør heading om til setningsstil:
     - Første alfabetiske ord: stor forbokstav (med mindre akronym/keep)
@@ -1139,12 +1152,14 @@ def _transform_heading_text(raw: str, keep_tokens: set):
     return "".join(out)
 
 def _heading_has_forbidden_context(tag) -> bool:
+    # 2.1.3
     # Skipp om headingen inneholder math/code osv.
     return any(desc.name in _SKIP_TAGS for desc in tag.descendants if getattr(desc, "name", None))
 
 # --- Hjelpere for §2.1.4 ------------------------------------------------------
 
 def _is_pagebreak(el) -> bool:
+    # 2.1.4
     if not getattr(el, "name", None):
         return False
     t = (el.get("epub:type") or "").lower().split()
@@ -1153,10 +1168,12 @@ def _is_pagebreak(el) -> bool:
     return ("pagebreak" in t) or ("doc-pagebreak" in r) or ("pagebreak" in cls)
 
 def _iter_pagebreaks_in_order(soup):
+    # 2.1.4
     # Stabil dokumentrekkefølge
     return [el for el in soup.find_all(True) if _is_pagebreak(el)]
 
 def _collect_between(prev, curr):
+    # 2.1.4
     """Samle noder mellom prev og curr i dokumentrekkefølge (ekskl. curr)."""
     nodes = []
     for x in prev.next_elements:
@@ -1166,6 +1183,7 @@ def _collect_between(prev, curr):
     return nodes
 
 def _has_visible_content(nodes):
+    # 2.1.4
     """
     Returner (has_visible, ambiguous_text).
     'visible' = ikke-whitespace tekst eller reelt innhold (img, svg, math, table, lister, osv.)
@@ -1202,6 +1220,7 @@ def _has_visible_content(nodes):
     return True, ""
 
 def _find_prev_significant(node):
+    # 2.1.4
     """Finn forrige signifikante node (ignorer ren whitespace)."""
     cur = node.previous_sibling
     # BeautifulSoup kan ha mye whitespace som siblings
@@ -1217,6 +1236,7 @@ def _find_prev_significant(node):
     return node.find_previous(lambda x: isinstance(x, NavigableString) and x.strip() or getattr(x, "name", None))
 
 def _find_block_insertion_anchor(pagebreak):
+    # 2.1.4
     """
     Sett inn <p> før nærmeste blokknivå-forelder som kan ta <p> som søsken.
     Dette unngår <p> inni <p>.
@@ -1229,6 +1249,7 @@ def _find_block_insertion_anchor(pagebreak):
 # --- Hjelpere for §2.1.5 ------------------------------------------------------
 
 def _nearest_lang(el):
+    # 2.1.5
     cur = el
     while cur is not None:
         # xml:lang og lang
@@ -1240,6 +1261,7 @@ def _nearest_lang(el):
     return ""
 
 def _moved_blank_phrase(lang: str) -> str:
+    # 2.1.5
     # nn ⇒ nynorsk; alt annet ⇒ bokmål (som spesifikasjonen sier)
     if lang.startswith("nn"):
         return "Innhaldet på denne sida har blitt flytta."
@@ -1248,6 +1270,7 @@ def _moved_blank_phrase(lang: str) -> str:
 # --- Hjelpere for §2.1.6 ------------------------------------------------------
 
 def _unwrap_nested_same_tags(soup, tagname):
+    # 2.1.6
     # <em><em>... -> <em>...</em> ; <strong><strong>... -> <strong>...</strong>
     changed = 0
     for inner in list(soup.find_all(tagname)):
@@ -1258,6 +1281,7 @@ def _unwrap_nested_same_tags(soup, tagname):
     return changed
 
 def _remove_empty_tags(soup, names=("em", "strong")):
+    # 2.1.6
     removed = 0
     for nm in names:
         for t in list(soup.find_all(nm)):
@@ -1271,6 +1295,7 @@ def _remove_empty_tags(soup, names=("em", "strong")):
     return removed
 
 def _split_em_around_strong(soup, strong):
+    # 2.1.6
     """
     strong er (potensielt dypt) inni en <em>.
     Vi løfter strong ut av nærmeste <em> slik at overlapp forsvinner:
@@ -1320,6 +1345,7 @@ def _split_em_around_strong(soup, strong):
 # --- Hjelpere for §2.1.6.3 ------------------------------------------------------
 
 def _rightmost_text_node(tag):
+    # 2.1.6.3
     # siste tekstnode inne i tag (dypt)
     for node in reversed(list(tag.descendants)):
         if isinstance(node, NavigableString):
@@ -1327,12 +1353,14 @@ def _rightmost_text_node(tag):
     return None
 
 def _leftmost_text_node(tag):
+    # 2.1.6.3
     for node in tag.descendants:
         if isinstance(node, NavigableString):
             return node
     return None
 
 def _move_leading_space_out(soup, tag):
+    # 2.1.6.3
     t = _leftmost_text_node(tag)
     if not t:
         return False
@@ -1347,6 +1375,7 @@ def _move_leading_space_out(soup, tag):
     return False
 
 def _move_trailing_space_out(soup, tag):
+    # 2.1.6.3
     t = _rightmost_text_node(tag)
     if not t:
         return False
@@ -1360,10 +1389,12 @@ def _move_trailing_space_out(soup, tag):
     return False
 
 def _entirely_textual(tag):
+    # 2.1.6.3
     # true hvis taggens innhold er ren tekst (ingen elementbarn)
     return all(not getattr(c, "name", None) for c in tag.contents)
 
 def _split_multi_sentence_emphasis(soup, tag):
+    # 2.1.6.3
     """
     Hvis taggen har ren tekst og inneholder flere setninger,
     splitt til separate <tagname> ved EoS. Behold EoS-tegn utenfor.
@@ -1415,6 +1446,7 @@ def _split_multi_sentence_emphasis(soup, tag):
     return made_change
 
 def _move_trailing_eos_out(soup, tag):
+    # 2.1.6.3
     """
     Flytt setningsslutttegn ut av taggen (hvis tilstede i siste tekstnode).
     Lar hermetegn/parantes som ligger ETTER punktum være med ut.
@@ -1441,12 +1473,14 @@ def _move_trailing_eos_out(soup, tag):
 # --- Hjelpere for §2.1.6.3 ------------------------------------------------------
 
 def _is_ignorable_text_node(node: NavigableString) -> bool:
+    # 2.1.6.3
     s = str(node)
     if not s or not s.strip():
         return True
     return bool(_PUNCT_ONLY_RX.match(s))
 
 def _has_em_or_strong_ancestor(node) -> bool:
+    # 2.1.6.3
     p = getattr(node, "parent", None)
     while p is not None:
         if getattr(p, "name", "").lower() in ("em","strong"):
@@ -1455,6 +1489,7 @@ def _has_em_or_strong_ancestor(node) -> bool:
     return False
 
 def _paragraph_fully_emphasized(p) -> bool:
+    # 2.1.6.3
     """
     'Hele avsnittet er uthevet' betyr:
     - For hver relevante tekstnode (ikke bare whitespace/ren tegnsetting):
@@ -1481,6 +1516,7 @@ def _paragraph_fully_emphasized(p) -> bool:
 # --- Hjelpere for §2.1.6.7 ------------------------------------------------------
 
 def _is_figcaption_like(el) -> bool:
+    # 2.1.6.7
     if not getattr(el, "name", None):
         return False
     nm = el.name.lower()
@@ -1495,6 +1531,7 @@ def _is_figcaption_like(el) -> bool:
     return False
 
 def _is_figure_text_extract(el) -> bool:
+    # 2.1.6.7
     if not getattr(el, "name", None):
         return False
     cls = " ".join(el.get("class", []) or []).strip()
@@ -1509,6 +1546,7 @@ def _is_figure_text_extract(el) -> bool:
 # --- Hjelpere for §2.1.7 ------------------------------------------------------
 
 def _has_skipped_ancestor(node) -> bool:
+    # 2.1.7
     p = getattr(node, "parent", None)
     while p is not None:
         if getattr(p, "name", "").lower() in _SKIP_ANCESTORS:
@@ -1519,6 +1557,7 @@ def _has_skipped_ancestor(node) -> bool:
 # --- Hjelpere for §2.1.7 ------------------------------------------------------
 
 def _is_toc_container(el) -> bool:
+    # 2.1.7
     if not getattr(el, "name", None):
         return False
     t = (el.get("epub:type") or "").lower()
@@ -1536,6 +1575,7 @@ def _is_toc_container(el) -> bool:
     return False
 
 def _iter_toc_containers(soup):
+    # 2.1.7
     # finn alle plausible TOC-bokser (nav/section/aside/div)
     containers = []
     for el in soup.find_all(True):
@@ -1547,6 +1587,7 @@ def _iter_toc_containers(soup):
 
 
 def _is_acronym(tok: str) -> bool:
+    # 2.1.7
     return bool(_ACRONYM_RX.match(tok)) or bool(_ROMAN_RX.match(tok))
 
 def _normalize_caps_sentence_style(text: str) -> str:
@@ -14031,9 +14072,41 @@ def run_xslt(input_xml, stylesheet, output_xml, logger):
     except subprocess.CalledProcessError as e:
         print("XSLT transformation failed:", e)
 
-def convert_epub(args, logger):
+# def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
+def convert(args, logger):
+    # Les fil og parse som XML/XHTML
+    logger.info(f"Applying Statped Mark-up Requirements to file:::: {args.file}")
+    if getattr(args, "data", None):
+        content = args.data
+    else:
+        content = Path(args.file).read_bytes()
+    try:
+        soup = BeautifulSoup(content, "xml")
 
+    except Exception:
+        # fallback hvis 'xml'-parser ikke er tilgjengelig
+        soup = BeautifulSoup(content, "lxml-xml")
+
+    # TODO: move args.folders to args
+    soup = apply_requirements(soup, logger, args.folders, args)
+    #save to file
+    with open(args.job_dir / f"{args.production_number}.xhtml", "wb") as f:
+        f.write(soup.prettify(formatter="minimal").encode("utf-8"))
+    status = "success"
+    message = "Fil er konvertert fra xhtml til xhtml med Statped Mark-up Requirements."
+    return {"status": status, "message": message}
+    #return soup.prettify(formatter="minimal").encode("utf-8")
+
+
+
+def convert02(args, logger):
+    #production_number = Path(file).stem
+    #if not production_number:
     production_number   = path.splitext(path.basename(args.input))[0]
+    timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S%f")
+    job_id = f"{production_number}-{timestamp}"
+    job_dir = ARTIFACTS_ROOT / job_id
+
     output_file         = path.join(getcwd(), f'{production_number}.epub')
     old_xhtml_files     = []
 
@@ -14167,7 +14240,7 @@ def main():
         ''')
 
     parser.add_argument('input',
-                        help = 'The input folder')
+                        help = 'The input file')
     parser.add_argument('-o',
                         '--output',
                         help = 'The output epub file')
@@ -14242,8 +14315,9 @@ def main():
     # Set up logger
     logger = getLogger(__name__)
     
+
     # Convert epub
-    convert_epub(args, logger)
+    convert(args, logger)
 
 
 if __name__ == '__main__':

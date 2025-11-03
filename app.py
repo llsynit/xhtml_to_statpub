@@ -1,10 +1,14 @@
 from __future__ import annotations
+import sys
 import os
 import uuid
 import tempfile
 import logging
 import time
 from datetime import datetime
+import shutil
+from fastapi.responses import FileResponse
+from fastapi import Request
 
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,8 +37,7 @@ from config import (MODULE_NAME_XHTML_TO_STATPUB, PORT_XHTML_TO_STATPUB, RABBITM
 
 load_dotenv()
 # Importér selve transformasjonen
-from xhtml2statpub import apply_requirements
-
+from xhtml2statpub import convert
 
 
 # -----------------------------------------------------------------------------
@@ -156,7 +159,7 @@ def make_folders(tmp_root: Optional[Path] = None) -> dict:
         "tmp": str(root / "tmp"),
         "source": str(root / "tmp" / "source"),
         "target": str(root / "tmp" / "target"),
-        "root": str(root / "tmp" / "target"),
+            "root": str(root / "tmp" / "target"),
         "epub": str(root / "tmp" / "target"),
     }
     # Sørg for at mappene eksisterer
@@ -174,6 +177,7 @@ def health():
 
 @app.post("/run")
 async def run(
+    request: Request,
     file: UploadFile = File(..., description="XHTML fra forrige steg i pipelinen"),
     # Felter som controlleren allerede sender (noen er ikke brukt her, men tillates for kompatibilitet):
     mathematics: bool = Form(False),
@@ -186,39 +190,72 @@ async def run(
     relocate: bool = Form(True),
     llm: bool = Form(False),
 ):
-    """
-    Ta imot en XHTML-fil, kjør apply_requirements, og returnér bearbeidet XHTML.
-    """
-    #logger = make_logger()
+    logger = make_logger()
     folders = make_folders()
-    production_number = Path(file).stem
+    t0 = time.time()
+    # Get original filename
+    xhtml_name = file.filename or ""
+    suffix = Path(file.filename or "").suffix or ".xhtml"
+    # Extract production_number from filename (basename without extension)
+    production_number = Path(xhtml_name).stem
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(await file.read())
+        xhtml_path = tmp.name
+
+
     timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S%f")
     job_id = f"{production_number}-{timestamp}"
     job_dir = ARTIFACTS_ROOT / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Job dir: {job_dir}")
 
-    # Les fil og parse som XML/XHTML
-    data = await file.read()
-    try:
-        soup = BeautifulSoup(data, "xml")
-    except Exception:
-        # fallback hvis 'xml'-parser ikke er tilgjengelig
-        soup = BeautifulSoup(data, "lxml-xml")
 
-    # Bygg args-objektet (dot-notasjon) slik apply_requirements forventer
+    logger.info(f"Running convert for production_number={production_number}, job_id={job_id}...")
+    data = await file.read()
+
+      # Bygg args-objektet (dot-notasjon) slik apply_requirements forventer
     args = SimpleNamespace(
+        file=xhtml_path,
+        folders=folders,
+        production_number=production_number,
+        data=data,
         mathematics=bool(mathematics),
         science=bool(science),
         grade=(int(grade) if grade is not None and str(grade).strip() != "" else None),
+        job_id=job_id,
+        job_dir=job_dir,
+        llm=bool(llm),
+        aggressive=bool(False),
+        relocate=bool(relocate),
     )
+    try:
+        status = convert(args, logger)
+    finally:
+        try:
+            os.unlink(xhtml_path)
 
-    # Kjør transformasjonen
-    soup = apply_requirements(soup, logger, folders, args)
+        except Exception:
+            pass
+    logger.info("xhtml to statpub completed, preparing artifacts...")
 
-    # Serialiser tilbake til XHTML
-    xhtml = soup.prettify(formatter="minimal")
-    return Response(content=xhtml.encode("utf-8"),
-                    media_type="application/xhtml+xml; charset=utf-8")
+
+    if not os.path.isdir(job_dir):
+        logger.warning(
+            f"Could not find artifact folder for this job: {job_dir}")
+        raise HTTPException(
+            500, f"Could not find artifact folder for this job: {job_dir}")
+
+    # Zip the folder to a temp file for download
+    zip_base = os.path.join(tempfile.gettempdir(), f"{job_id}")
+    # returns path/to/<base>.zip
+    zip_path = shutil.make_archive(zip_base, "zip", job_dir)
+
+    headers = {
+        "X-Validation-Status": status.get("status"),
+        "X-Processing-Time-ms": str(int((time.time() - t0) * 1000)),
+    }
+    download_name = f"{production_number}-artifacts.zip"
+    return FileResponse(zip_path, media_type="application/zip", filename=download_name, headers=headers)
 
 
 # =============================================================================
@@ -230,30 +267,57 @@ async def _handle_work_message(m: aio_pika.IncomingMessage):
     async with m.process():
         data = __import__("json").loads(m.body.decode("utf-8"))
         inputs = data.get("inputs") or {}
-        file =  inputs.get("xhtml_uri"),
-        mathematics = data.get("job_id"),
-        science = data.get("job_id"),
-        grade = data.get("job_id"),
-        link_footnotes = data.get("job_id"),  # ikke brukt her
-        verbose = data.get("job_id"),         # ikke brukt her
-        toc_levels =data.get("job_id"),  # ikke brukt her
-        p_length = data.get("job_id"),    # ikke brukt her
-        relocate = data.get("job_id"),
+        file =  inputs.get("xhtml_uri")
+        mathematics = data.get("mathematics")
+        science = data.get("science")
+        grade = data.get("grade")
+        link_footnotes = data.get("link_footnotes")  # ikke brukt her
+        verbose = data.get("verbose")       # ikke brukt her
+        toc_levels =data.get("toc_levels")  # ikke brukt her
+        p_length = data.get("p_length")    # ikke brukt her
+        relocate = data.get("relocate")
         llm = data.get("llm")
         stage = data.get("stage")
         job_id = data.get("job_id")
         corr_id = data.get("correlation_id") or m.correlation_id
+        production_number = str(data.get("production_number") or "")
 
 
         job_dir = ARTIFACTS_ROOT / job_id
         tmp_xhtml = job_dir / "input.xhtml"
          # 1) Fetch xhtml
         await _http_download_to(tmp_xhtml, file)
+        logger = make_logger()
+        folders = make_folders()
+
+        # test vars
+        grade = 8
+        mathematics = False
+        science = False
+        args = SimpleNamespace(
+            file=file,
+            folders=folders,
+            production_number=production_number,
+            mathematics=bool(mathematics),
+            p_length=p_length,
+            toc_levels=toc_levels,
+            link_footnotes=bool(link_footnotes),
+            verbose=bool(verbose),
+            science=bool(science),
+            grade=(int(grade) if grade is not None and str(grade).strip() != "" else None),
+            stage = data.get("stage"),
+            job_id = data.get("job_id"),
+            job_dir = job_dir,
+            corr_id = data.get("correlation_id") or m.correlation_id,
+            llm=bool(llm),
+            aggressive=bool(False),
+            relocate=bool(relocate),
+        )
+
 
         # 2) Run insert_metadata
         try:
-            status = insert_metadata(production_number, job_id, str(tmp_xhtml), str(
-                tmp_opf), publication_format="epub")
+            status = convert(args, logger)
         except Exception as e:
             # crash → publish fail
             artifacts = {"error": f"insert_metadata crashed: {e}"}
@@ -265,7 +329,7 @@ async def _handle_work_message(m: aio_pika.IncomingMessage):
             return
         finally:
             try:
-                tmp_opf.unlink(missing_ok=True)
+                file.unlink(missing_ok=True)
             except Exception:
                 pass
 
