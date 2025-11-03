@@ -7145,7 +7145,7 @@ def _row_headings(table, header_row=None):
                 out.append(txt)
     return out
 
-def _mk_ul(items, cls):
+def _mk_ul(soup, items, cls):
     if not items:
         return None
     ul = soup.new_tag("ul")
@@ -13476,8 +13476,8 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             fc.string = cap_text
             fig.append(fc)
 
-        ul_cols = _mk_ul(cols, "col-headings")
-        ul_rows = _mk_ul(rows, "row-headings")
+        ul_cols = _mk_ul(soup, cols, "col-headings")
+        ul_rows = _mk_ul(soup, rows, "row-headings")
         if ul_cols: fig.append(ul_cols)
         if ul_rows: fig.append(ul_rows)
 
