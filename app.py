@@ -228,6 +228,7 @@ async def run(
         aggressive=bool(False),
         relocate=bool(relocate),
     )
+    logger.info(f"Args: {args}")
     try:
         status = convert(args, logger)
     finally:
@@ -267,7 +268,7 @@ async def _handle_work_message(m: aio_pika.IncomingMessage):
     async with m.process():
         data = __import__("json").loads(m.body.decode("utf-8"))
         inputs = data.get("inputs") or {}
-        file =  inputs.get("xhtml_uri")
+        xhtml_uri =  inputs.get("xhtml_uri")
         mathematics = data.get("mathematics")
         science = data.get("science")
         grade = data.get("grade")
@@ -284,9 +285,10 @@ async def _handle_work_message(m: aio_pika.IncomingMessage):
 
 
         job_dir = ARTIFACTS_ROOT / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
         tmp_xhtml = job_dir / "input.xhtml"
          # 1) Fetch xhtml
-        await _http_download_to(tmp_xhtml, file)
+        await _http_download_to(tmp_xhtml, xhtml_uri)
         logger = make_logger()
         folders = make_folders()
 
@@ -295,7 +297,7 @@ async def _handle_work_message(m: aio_pika.IncomingMessage):
         mathematics = False
         science = False
         args = SimpleNamespace(
-            file=file,
+            file=str(tmp_xhtml),
             folders=folders,
             production_number=production_number,
             mathematics=bool(mathematics),
@@ -314,13 +316,15 @@ async def _handle_work_message(m: aio_pika.IncomingMessage):
             relocate=bool(relocate),
         )
 
+        #print(f"Args: {args}")
+        logger.info(f"Args: {args}")
 
-        # 2) Run insert_metadata
+        # 2) Run xhtml_to_statpub
         try:
             status = convert(args, logger)
         except Exception as e:
             # crash → publish fail
-            artifacts = {"error": f"insert_metadata crashed: {e}"}
+            artifacts = {"error": f"xhtml_to_statpub crashed: {e}"}
             await _publish_result(stage, job_id, "fail", artifacts, corr_id)
             try:
                 tmp_xhtml.unlink(missing_ok=True)
@@ -329,7 +333,7 @@ async def _handle_work_message(m: aio_pika.IncomingMessage):
             return
         finally:
             try:
-                file.unlink(missing_ok=True)
+                tmp_xhtml.unlink(missing_ok=True)
             except Exception:
                 pass
 
