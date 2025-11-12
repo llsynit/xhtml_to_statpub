@@ -1,48 +1,50 @@
 # Bruk en slank base
 FROM python:3.12-slim
 
-# --- Systemavhengigheter (juster etter behov) ---
-# tesseract-ocr: trengs av pytesseract hvis du bruker OCR
-# default-jre-headless: trengs hvis python-pakken epubcheck bruker Java
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    tesseract-ocr \
-    default-jre-headless \
- && rm -rf /var/lib/apt/lists/*
+# --- Miljøvariabler / paths ---
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    HOME=/app \
+    MPLCONFIGDIR=/app/.cache/matplotlib \
+    NLTK_DATA=/usr/local/share/nltk_data
 
-# --- Kataloger og miljø ---
 WORKDIR /app
 
-# Gjør cache/konfigskriving mulig for Matplotlib og NLTK
-ENV HOME=/app \
-    MPLCONFIGDIR=/app/.cache/matplotlib \
-    NLTK_DATA=/usr/local/share/nltk_data \
-    PIP_NO_CACHE_DIR=1
+# --- Systemavhengigheter ---
+# tesseract-ocr: for pytesseract (OCR)
+# default-jre-headless: for Java-baserte verktøy (f.eks. epubcheck / Saxon)
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      tesseract-ocr \
+      default-jre-headless \
+ && rm -rf /var/lib/apt/lists/*
 
+# Kataloger som trenger å finnes og være skrivbare
 RUN mkdir -p "$MPLCONFIGDIR" "$NLTK_DATA"
 
-# --- Avhengigheter ---
+# --- Python-avhengigheter ---
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m pip install --no-cache-dir -r requirements.txt
 
-# Last ned NLTK-ressurser ved byggtid (ikke ved runtime)
-# punkt_tab finnes i nyere NLTK (>=3.9)
+# Last ned NLTK-ressurser ved build (slipper nett-krav ved runtime)
 RUN python - <<'PY'
 import nltk
-try:
-    nltk.download('punkt')
-except Exception as e:
-    print("WARN: punkt download failed:", e)
-try:
-    nltk.download('punkt_tab')
-except Exception as e:
-    print("WARN: punkt_tab download failed (ok på eldre NLTK):", e)
+for pkg in ("punkt", "punkt_tab"):
+    try:
+        nltk.download(pkg)
+    except Exception as e:
+        print(f"WARN: download of {pkg} failed:", e)
 PY
 
 # --- App-kode ---
-COPY . .
+COPY saxon static app.py config.py utils.py xhtml2statpub.py app/
+RUN mkdir -p /app/artifacts
 
-# (Valgfritt) kjør som non-root med skrivetilgang
-RUN useradd -m -u 10001 appuser && chown -R appuser:appuser /app /usr/local/share/nltk_data
+# --- Non-root bruker ---
+RUN useradd -m -u 10001 appuser \
+ && chown -R appuser:appuser /app "$NLTK_DATA"
+
 USER appuser
 
 EXPOSE 39005
