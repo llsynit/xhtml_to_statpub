@@ -6,12 +6,15 @@ import tempfile
 import logging
 import time
 from datetime import datetime
+import shutil
+from fastapi.responses import FileResponse
+from fastapi import Request
 
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional, Dict
 from urllib.parse import urlparse
-from contextlib import suppress
+from contextlib import suppress, asynccontextmanager
 import asyncio
 import aio_pika
 import httpx
@@ -174,6 +177,7 @@ def health():
 
 @app.post("/run")
 async def run(
+    request: Request,
     file: UploadFile = File(..., description="XHTML fra forrige steg i pipelinen"),
     # Felter som controlleren allerede sender (noen er ikke brukt her, men tillates for kompatibilitet):
     mathematics: bool = Form(False),
@@ -186,48 +190,73 @@ async def run(
     relocate: bool = Form(True),
     llm: bool = Form(False),
 ):
-    """
-    Ta imot en XHTML-fil, kjør apply_requirements, og returnér bearbeidet XHTML.
-    """
     logger = make_logger()
     folders = make_folders()
-    production_number = Path(file).stem
+    t0 = time.time()
+    # Get original filename
+    xhtml_name = file.filename or ""
+    suffix = Path(file.filename or "").suffix or ".xhtml"
+    # Extract production_number from filename (basename without extension)
+    production_number = Path(xhtml_name).stem
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(await file.read())
+        xhtml_path = tmp.name
+
     timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S%f")
     job_id = f"{production_number}-{timestamp}"
     job_dir = ARTIFACTS_ROOT / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Job dir: {job_dir}")
+
+
+    logger.info(f"Running convert for production_number={production_number}, job_id={job_id}...")
     data = await file.read()
 
-    # MOVED TO xhtml_to_statpub.py
-    '''
-    # Les fil og parse som XML/XHTML
-    try:
-        soup = BeautifulSoup(data, "xml")
-    except Exception:
-        # fallback hvis 'xml'-parser ikke er tilgjengelig
-        soup = BeautifulSoup(data, "lxml-xml")
-    '''
-
-    # Bygg args-objektet (dot-notasjon) slik apply_requirements forventer
+      # Bygg args-objektet (dot-notasjon) slik apply_requirements forventer
     args = SimpleNamespace(
-        file=file,
+        file=xhtml_path,
         folders=folders,
+        production_number=production_number,
         data=data,
         mathematics=bool(mathematics),
         science=bool(science),
         grade=(int(grade) if grade is not None and str(grade).strip() != "" else None),
+        job_id=job_id,
+        job_dir=job_dir,
+        llm=bool(llm),
+        aggressive=bool(False),
+        relocate=bool(relocate),
+        logger=logger,
     )
+    logger.info(f"Args: {args}")
+    try:
+        status = convert(args)
+    finally:
+        try:
+            os.unlink(xhtml_path)
 
-    # MOVED TO xhtml_to_statpub.py
-    # Kjør transformasjonen
-    # soup = apply_requirements(soup, logger, folders, args)
+        except Exception:
+            pass
+    logger.info("xhtml to statpub completed, preparing artifacts...")
 
-    # MOVED TO xhtml_to_statpub.py
-    # Serialiser tilbake til XHTML
-    # xhtml = soup.prettify(formatter="minimal")
-    xhtml = convert(args, logger)
-    return Response(content=xhtml.encode("utf-8"),
-                    media_type="application/xhtml+xml; charset=utf-8")
+
+    if not os.path.isdir(job_dir):
+        logger.warning(
+            f"Could not find artifact folder for this job: {job_dir}")
+        raise HTTPException(
+            500, f"Could not find artifact folder for this job: {job_dir}")
+
+    # Zip the folder to a temp file for download
+    zip_base = os.path.join(tempfile.gettempdir(), f"{job_id}")
+    # returns path/to/<base>.zip
+    zip_path = shutil.make_archive(zip_base, "zip", job_dir)
+
+    headers = {
+        "X-Validation-Status": status.get("status"),
+        "X-Processing-Time-ms": str(int((time.time() - t0) * 1000)),
+    }
+    download_name = f"{production_number}-artifacts.zip"
+    return FileResponse(zip_path, media_type="application/zip", filename=download_name, headers=headers)
 
 
 # =============================================================================
@@ -239,33 +268,63 @@ async def _handle_work_message(m: aio_pika.IncomingMessage):
     async with m.process():
         data = __import__("json").loads(m.body.decode("utf-8"))
         inputs = data.get("inputs") or {}
-        file =  inputs.get("xhtml_uri"),
-        mathematics = data.get("job_id"),
-        science = data.get("job_id"),
-        grade = data.get("job_id"),
-        link_footnotes = data.get("job_id"),  # ikke brukt her
-        verbose = data.get("job_id"),         # ikke brukt her
-        toc_levels =data.get("job_id"),  # ikke brukt her
-        p_length = data.get("job_id"),    # ikke brukt her
-        relocate = data.get("job_id"),
+        xhtml_uri =  inputs.get("xhtml_uri")
+        mathematics = data.get("mathematics")
+        science = data.get("science")
+        grade = data.get("grade")
+        link_footnotes = data.get("link_footnotes")  # ikke brukt her
+        verbose = data.get("verbose")       # ikke brukt her
+        toc_levels =data.get("toc_levels")  # ikke brukt her
+        p_length = data.get("p_length")    # ikke brukt her
+        relocate = data.get("relocate")
         llm = data.get("llm")
         stage = data.get("stage")
         job_id = data.get("job_id")
         corr_id = data.get("correlation_id") or m.correlation_id
+        production_number = str(data.get("production_number") or "")
 
 
         job_dir = ARTIFACTS_ROOT / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
         tmp_xhtml = job_dir / "input.xhtml"
          # 1) Fetch xhtml
-        await _http_download_to(tmp_xhtml, file)
+        await _http_download_to(tmp_xhtml, xhtml_uri)
+        logger = make_logger()
+        folders = make_folders()
 
-        # 2) Run insert_metadata
+        # test vars
+        grade = 8
+        mathematics = False
+        science = False
+        args = SimpleNamespace(
+            file=str(tmp_xhtml),
+            folders=folders,
+            production_number=production_number,
+            mathematics=bool(mathematics),
+            p_length=p_length,
+            toc_levels=toc_levels,
+            link_footnotes=bool(link_footnotes),
+            verbose=bool(verbose),
+            science=bool(science),
+            grade=(int(grade) if grade is not None and str(grade).strip() != "" else None),
+            stage = data.get("stage"),
+            job_id = data.get("job_id"),
+            job_dir = job_dir,
+            corr_id = data.get("correlation_id") or m.correlation_id,
+            llm=bool(llm),
+            aggressive=bool(False),
+            relocate=bool(relocate),
+        )
+
+        #print(f"Args: {args}")
+        logger.info(f"Args: {args}")
+
+        # 2) Run xhtml_to_statpub
         try:
-            status = insert_metadata(production_number, job_id, str(tmp_xhtml), str(
-                tmp_opf), publication_format="epub")
+            status = convert(args, logger)
         except Exception as e:
             # crash → publish fail
-            artifacts = {"error": f"insert_metadata crashed: {e}"}
+            artifacts = {"error": f"xhtml_to_statpub crashed: {e}"}
             await _publish_result(stage, job_id, "fail", artifacts, corr_id)
             try:
                 tmp_xhtml.unlink(missing_ok=True)
@@ -274,7 +333,7 @@ async def _handle_work_message(m: aio_pika.IncomingMessage):
             return
         finally:
             try:
-                tmp_opf.unlink(missing_ok=True)
+                tmp_xhtml.unlink(missing_ok=True)
             except Exception:
                 pass
 
@@ -370,7 +429,7 @@ async def _cleanup_loop():
             logger.warning("Artifacts cleanup loop error: %r", e)
         await asyncio.sleep(ARTIFACTS_CLEAN_INTERVAL_SEC)
 
-
+'''
 @app.on_event("startup")
 async def on_startup():
     # Try once, but do NOT crash the app if it fails
@@ -410,3 +469,51 @@ async def shutdown():
     if conn:
         with suppress(Exception):
             await conn.close()
+'''
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup logic (tidligere @app.on_event("startup"))
+    ok = await _setup_amqp_once()
+    if not ok:
+        # Eventuell bakgrunnsreconnector
+        app.state._amqp_reconnector_task = asyncio.create_task(
+            _amqp_reconnector_loop()
+        )
+
+    logger.info("Starting artifacts cleanup loop...")
+    app.state._cleanup_task = asyncio.create_task(_cleanup_loop())
+
+    try:
+        # Her kjører selve appen
+        yield
+    finally:
+        # Shutdown logic (tidligere @app.on_event("shutdown"))
+
+        # Stopp cleanup-loop
+        task = getattr(app.state, "_cleanup_task", None)
+        if task:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+        # Stopp AMQP-reconnector (hvis startet)
+        task = getattr(app.state, "_amqp_reconnector_task", None)
+        if task:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+        # Lukk AMQP-kanal/tilkobling
+        ch = getattr(app.state, "amqp_ch", None)
+        if ch:
+            with suppress(Exception):
+                await ch.close()
+
+        conn = getattr(app.state, "amqp_conn", None)
+        if conn:
+            with suppress(Exception):
+                await conn.close()
+
+# Fortell FastAPI at den skal bruke lifespan-handleren
+app.router.lifespan_context = lifespan
