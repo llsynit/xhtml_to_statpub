@@ -19,7 +19,7 @@ from io             import StringIO, BytesIO
 from glob           import glob
 from zipfile        import ZipFile, ZIP_DEFLATED
 from shutil         import rmtree, copytree, copyfile, make_archive, move
-from os             import path, mkdir, getcwd, walk, remove, rename
+from os             import path, mkdir, getcwd, walk, remove, rename, makedirs
 from pathlib        import Path
 from nltk.tokenize  import word_tokenize
 from ipapy          import is_valid_ipa
@@ -55,6 +55,8 @@ except ImportError:
     import Image
 import pytesseract
 # nltk.download('punkt_tab') -> moved to Dockerfile
+
+from config import ARTIFACTS_ROOT, ARTIFACTS_RETENTION_HOURS
 
 # VARIBLES
 # ========
@@ -3834,7 +3836,7 @@ def _find_insertion_point(section: Tag) -> Tag | None:
         return children[last_media_idx].next_sibling  # insert after
     return None  # append at end
 
-def _ensure_glossary_container(section: Tag, lang: str) -> tuple[Tag, int]:
+def _ensure_glossary_container(soup, section: Tag, lang: str) -> tuple[Tag, int]:
     """Sikre/lag <aside class="glossary" data-relocated="dl-glossary"> med hovedoverskrift."""
     container = section.find("aside", recursive=False, attrs={"data-relocated": "dl-glossary"})
     if container:
@@ -3868,7 +3870,7 @@ def _ensure_glossary_container(section: Tag, lang: str) -> tuple[Tag, int]:
             section.append(container)
     return container, level
 
-def _ensure_page_group(container: Tag, page_label: str, sub_level: int, lang: str) -> Tag:
+def _ensure_page_group(soup, container: Tag, page_label: str, sub_level: int, lang: str) -> Tag:
     """Sikre underoverskrift h(sub_level+1) 'Side N'/'Page N:' og en <dl data-page='N'> like etter."""
     # Sjekk om vi allerede har en gruppe for denne siden
     dl_page = None
@@ -7374,10 +7376,10 @@ def _is_source_like_tag(tag) -> bool:
         return _looks_like_source_text(_node_text(tag))
     return False
 
-def _ensure_llm(logger, args):
+def _ensure_llm(args):
     try:
         if getattr(args, "llm", False):
-            return _ensure_llm_client(logger, args.llm)
+            return _ensure_llm_client(args.logger, args.llm)
     except NameError:
         pass
     return None
@@ -8336,11 +8338,11 @@ def _apply_runs_replace(soup, text_node: NavigableString, actions):
 
 # =============== APPLY REQUIREMENTS ================
 
-def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
-    logger.info('Applying Statped Mark-up Requirements')
+def apply_requirements(soup, folders, args, comic_text_rpc=None):
+    args.logger.info('Applying Statped Mark-up Requirements')
 
     use_llm = args.llm
-    agressive = args.aggressive
+    aggressive = args.aggressive
 
     try:
         args.grade = int(args.grade)
@@ -8351,14 +8353,14 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     if 'lang' not in soup.html.attrs.keys():
         if 'xml:lang' in soup.html.attrs.keys():
             soup.html['lang'] = soup.html['xml:lang']
-            logger.warning(f'html tag missing lang attribute, using xml:lang="{soup.html["lang"]}"')
+            args.logger.warning(f'html tag missing lang attribute, using xml:lang="{soup.html["lang"]}"')
         else:
             soup.html['lang'] = 'no'
-            logger.warning('html tag missing lang and xml:lang attributes, assuming lang="no"')
+            args.logger.warning('html tag missing lang and xml:lang attributes, assuming lang="no"')
 
 
     # 2.1.1 CSS — ensure exact Statped requirement
-    logger.info('2.1.1 - Ensuring ebok.css link in <head>')
+    args.logger.info('2.1.1 - Ensuring ebok.css link in <head>')
 
     head = soup.head
     if head is None:
@@ -8389,7 +8391,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             link.decompose()
             removed += 1
     if removed:
-        logger.warning(f'2.1.1 - Removed {removed} other stylesheet link(s)')
+        args.logger.warning(f'2.1.1 - Removed {removed} other stylesheet link(s)')
 
     # Sett inn eller normaliser ebok.css-lenken
     if has_ebok is None:
@@ -8400,11 +8402,11 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             first_style.insert_before(link)
         else:
             head.append(link)
-        logger.info('2.1.1 - Inserted <link rel="stylesheet" href="ebok.css" />')
+        args.logger.info('2.1.1 - Inserted <link rel="stylesheet" href="ebok.css" />')
     else:
         has_ebok['href'] = CSS_HREF
         has_ebok['type'] = 'text/css'
-        logger.info('2.1.1 - Normalized existing ebok.css link')
+        args.logger.info('2.1.1 - Normalized existing ebok.css link')
 
     # Plasser selve CSS-filen ved siden av ut-XHTML (matching href)
     copy_target_dir = folders['output']  # ingen 'css/'-undermappe iht. §2.1.1
@@ -8422,12 +8424,12 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Idempotent; merker med data-original-tag for sporbarhet.
     - Tips: Kjør før 2.6 og før 2.1.2-relokering.
     """
-    logger.info("2.6.1 - Boxes in mathematics books")
+    args.logger.info("2.6.1 - Boxes in mathematics books")
 
     if not getattr(args, "mathematics", False):
-        logger.info("2.6.1 - Not a mathematics book; skipping.")
+        args.logger.info("2.6.1 - Not a mathematics book; skipping.")
     else:
-        llm = _ensure_llm_client(logger, use_llm) if use_llm else None
+        llm = _ensure_llm_client(args.logger, use_llm) if use_llm else None
 
         converted = kept_aside = heading_adjusted = framed = 0
 
@@ -8477,7 +8479,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             _normalize_frame_classes(div)
             framed += 1
 
-        logger.info(
+        args.logger.info(
             "2.6.1 - Done. converted=%d, kept_aside=%d, headings_adjusted=%d, framed=%d",
             converted, kept_aside, heading_adjusted, framed
         )
@@ -8494,9 +8496,9 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
       Integrerte asides blir *ikke* flyttet; de konverteres til <div> og beholdes der de står.
     """
     if args.relocate:
-        logger.info("2.1.2 - Relocation disabled (--no-relocate).")
+        args.logger.info("2.1.2 - Relocation disabled (--no-relocate).")
 
-        llm = _ensure_llm_client(logger, args.llm)
+        llm = _ensure_llm_client(args.logger, args.llm)
 
         moved_counts_total = {"images": 0, "asides": 0, "glossaries": 0, "asides_kept_as_div": 0}
         chapter_containers = _iter_chapter_like_containers(soup)
@@ -8625,7 +8627,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 _insert_before_anchor_or_end(node)
                 moved_counts_total["glossaries"] += 1
 
-        logger.info(
+        args.logger.info(
             "2.1.2 - Relocated: images=%d, asides=%d, glossaries=%d; kept_as_div=%d",
             moved_counts_total["images"],
             moved_counts_total["asides"],
@@ -8641,18 +8643,18 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Unntak: akronymer/initialismer, romertall; bevar matte/kode.
     - Valgfritt LLM (args.llm): kan returnere tokens (egennavn/brand) som skal bevares.
     """
-    logger.info("2.1.3 - Uppercase text (headings)")
+    args.logger.info("2.1.3 - Uppercase text (headings)")
 
     # Initier LLM-klient hvis ønsket
-    llm = _ensure_llm_client(logger, args.llm)
+    llm = _ensure_llm_client(args.logger, args.llm)
 
     for h in soup(re.compile(r'^h[1-6]$', re.I)):
         if _heading_has_forbidden_context(h):
-            logger.info(f'2.1.3 - Skipping heading with math/code: "{h.get_text(strip=True)}"')
+            args.logger.info(f'2.1.3 - Skipping heading with math/code: "{h.get_text(strip=True)}"')
             continue
 
         original_html_text = _collect_heading_text(h)
-        keep = _llm_exceptions_for_heading(llm, logger, original_html_text)
+        keep = _llm_exceptions_for_heading(llm, args.logger, original_html_text)
 
         # Gå gjennom alle tekst-noder så vi bevarer <em>, <span> osv.
         first_seen = {"done": False}  # ikke nødvendig nå, vi normaliserer per tekstbit med helheten i keep-settet
@@ -8669,7 +8671,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 changed_any = True
 
         if changed_any:
-            logger.info(f'2.1.3 - Heading: "{original_html_text}" -> "{h.get_text(" ", strip=True)}"')
+            args.logger.info(f'2.1.3 - Heading: "{original_html_text}" -> "{h.get_text(" ", strip=True)}"')
 
 
     # 2.1.5 Blank pages where elements have been moved
@@ -8678,7 +8680,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     2.1.5: Når elementer er flyttet bort og siden står tom:
     sett inn nynorsk/bokmål-frasen foran den neste pagebreaken i segmentet.
     """
-    logger.info("2.1.5 - Blank pages where elements have been moved")
+    args.logger.info("2.1.5 - Blank pages where elements have been moved")
 
     pbs = _iter_pagebreaks_in_order(soup)
 
@@ -8691,10 +8693,10 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 moved_from_counts[seg] += 1
 
         if not moved_from_counts:
-            logger.info("2.1.5 - No moved elements tagged; nothing to do.")
+            args.logger.info("2.1.5 - No moved elements tagged; nothing to do.")
 
         # Valgfri LLM — normalt ikke nødvendig
-        llm = _ensure_llm_client(logger, args.llm) if args.llm else None
+        llm = _ensure_llm_client(args.logger, args.llm) if args.llm else None
 
         inserted = 0
         for i in range(1, len(pbs)):
@@ -8723,7 +8725,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 if prev_text_lower != phrase.lower():
                     # erstatt "Blank side." (eller feil variant) med riktig flyttet-frase
                     prev_sig.string.replace_with(phrase)
-                    logger.info(f'2.1.5 - Replaced existing marker with "{phrase}" before {seg_id}')
+                    args.logger.info(f'2.1.5 - Replaced existing marker with "{phrase}" before {seg_id}')
                 continue
 
             # (Svært) ambig: la ev. LLM si nei (typisk ikke nødvendig)
@@ -8737,7 +8739,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                     if not bool(resp.get("blank", True)):
                         continue
                 except Exception as e:
-                    logger.warning(f"2.1.5 - LLM unavailable ({e}); continuing with deterministic rule.")
+                    args.logger.warning(f"2.1.5 - LLM unavailable ({e}); continuing with deterministic rule.")
 
             # Sett inn frasen på blokknivå før 'curr'
             p = soup.new_tag("p")
@@ -8748,9 +8750,9 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
             pid = prev.get("id") or "?"
             cid = seg_id
-            logger.info(f'2.1.5 - Inserted "{phrase}" between pagebreaks {pid} -> {cid}')
+            args.logger.info(f'2.1.5 - Inserted "{phrase}" between pagebreaks {pid} -> {cid}')
 
-        logger.info(f"2.1.5 - Done. Inserted {inserted} moved-blank markers.")
+        args.logger.info(f"2.1.5 - Done. Inserted {inserted} moved-blank markers.")
 
     # 2.1.4 Blank pages in the original source
     """
@@ -8758,11 +8760,11 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     Sett inn <p>Blank side.</p> mellom to påfølgende pagebreaks der det ikke finnes
     synlig innhold imellom.
     """
-    logger.info("2.1.4 - Blank pages in the original source")
+    args.logger.info("2.1.4 - Blank pages in the original source")
     pbs = _iter_pagebreaks_in_order(soup)
     if not len(pbs) < 2:
         # Valgfritt: LLM (normalt ikke nødvendig)
-        llm = _ensure_llm_client(logger, args.llm) if args.llm else None
+        llm = _ensure_llm_client(args.logger, args.llm) if args.llm else None
 
         inserted = 0
         for i in range(1, len(pbs)):
@@ -8788,7 +8790,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                     if not bool(resp.get("blank", True)):
                         continue  # LLM mener ikke blank, hopp over
                 except Exception as e:
-                    logger.warning(f"2.1.4 - LLM unavailable ({e}); continuing with deterministic rule.")
+                    args.logger.warning(f"2.1.4 - LLM unavailable ({e}); continuing with deterministic rule.")
 
             # Sett inn "Blank side." før curr, på blokknivå
             p = soup.new_tag("p")
@@ -8800,9 +8802,9 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
             cid = curr.get("id") or "?"
             pid = prev.get("id") or "?"
-            logger.info(f'2.1.4 - Inserted "Blank side." between pagebreaks {pid} -> {cid}')
+            args.logger.info(f'2.1.4 - Inserted "Blank side." between pagebreaks {pid} -> {cid}')
 
-        logger.info(f"2.1.4 - Done. Inserted {inserted} 'Blank side.' paragraphs.")
+        args.logger.info(f"2.1.4 - Done. Inserted {inserted} 'Blank side.' paragraphs.")
 
 
     # 2.1.6 Use of <em> and <strong>
@@ -8814,7 +8816,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Rene <em>-områder skal bestå.
     - Idempotent.
     """
-    logger.info("2.1.6.1 - Do not use double emphasis")
+    args.logger.info("2.1.6.1 - Do not use double emphasis")
 
     changed = True
     total_changes = 0
@@ -8829,7 +8831,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             # Har s en em-ancestor?
             if s.find_parent("em"):
                 if _split_em_around_strong(soup, s):
-                    logger.info("2.1.6.1 - Split <em> around <strong> to drop overlap")
+                    args.logger.info("2.1.6.1 - Split <em> around <strong> to drop overlap")
                     total_changes += 1
                     changed = True
 
@@ -8838,7 +8840,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         for em in list(soup.find_all("em")):
             if em.find_parent("strong"):
                 em.unwrap()
-                logger.info("2.1.6.1 - Unwrapped <em> under <strong> (overlap -> strong only)")
+                args.logger.info("2.1.6.1 - Unwrapped <em> under <strong> (overlap -> strong only)")
                 total_changes += 1
                 changed = True
 
@@ -8847,7 +8849,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         total_changes += _unwrap_nested_same_tags(soup, "strong")
         total_changes += _remove_empty_tags(soup, ("em", "strong"))
 
-    logger.info(f"2.1.6.1 - Finished. Changes applied: {total_changes}")
+    args.logger.info(f"2.1.6.1 - Finished. Changes applied: {total_changes}")
 
     # 2.1.6.2 Headings in <em> or <strong>
     """
@@ -8856,7 +8858,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     Hopper over tilfeller inne i <code>/<pre>/<math>.
     Idempotent.
     """
-    logger.info("2.1.6.2 - Headings in <em> or <strong>")
+    args.logger.info("2.1.6.2 - Headings in <em> or <strong>")
     changed = 0
     heads = soup(re.compile(r"^h[1-6]$", re.I))
 
@@ -8874,9 +8876,9 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             node.unwrap()
             changed += 1
             if preview:
-                logger.info(f'2.1.6.2 - Unwrapped emphasis in heading: "{preview}"')
+                args.logger.info(f'2.1.6.2 - Unwrapped emphasis in heading: "{preview}"')
 
-    logger.info(f"2.1.6.2 - Done. Removed {changed} <em>/<strong> tag(s) inside headings.")
+    args.logger.info(f"2.1.6.2 - Done. Removed {changed} <em>/<strong> tag(s) inside headings.")
 
     # 2.1.6.3 Use of <em> or <strong> in words and expressions
     """
@@ -8886,7 +8888,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
       enkel heuristikk: hvis taggen rommer flere setninger -> splitt i separate tagger).
     - Hvis én tag dekker flere setninger (ren tekst), splitt ved EoS.
     """
-    logger.info("2.1.6.3 - Use of <em>/<strong> in words and expressions")
+    args.logger.info("2.1.6.3 - Use of <em>/<strong> in words and expressions")
 
     changed_total = 0
     # Prosesser både <em> og <strong>
@@ -8899,19 +8901,19 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         # 2) Hvis ren tekst og flere setninger -> splitt i separate tagger
         if _entirely_textual(tag) and SENT_SPLIT_RX.search(tag.get_text()):
             if _split_multi_sentence_emphasis(soup, tag):
-                logger.info("2.1.6.3 - Split multi-sentence emphasis into separate tags")
+                args.logger.info("2.1.6.3 - Split multi-sentence emphasis into separate tags")
                 changed_total += 1
                 continue  # original tag er nå borte; neste loop
 
         # 3) Flytt setningsslutt-tegn ut av taggen
         if _move_trailing_eos_out(soup, tag):
-            logger.info("2.1.6.3 - Moved end-of-sentence punctuation outside emphasis")
+            args.logger.info("2.1.6.3 - Moved end-of-sentence punctuation outside emphasis")
             changed = True
 
         if changed:
             changed_total += 1
 
-    logger.info(f"2.1.6.3 - Done. Changes: {changed_total}")
+    args.logger.info(f"2.1.6.3 - Done. Changes: {changed_total}")
 
     # 2.1.6.4 Paragraphs in <em> or <strong>
     """
@@ -8919,7 +8921,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     Hvis *alt reelt innhold* i <p> ligger under em/strong, unwrap alle em/strong.
     Idempotent og forsiktig (rører ikke delvis uthevede avsnitt).
     """
-    logger.info("2.1.6.4 - Paragraphs in <em> or <strong>")
+    args.logger.info("2.1.6.4 - Paragraphs in <em> or <strong>")
     changed = 0
 
     for p in soup.find_all("p"):
@@ -8935,9 +8937,9 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             ems.unwrap()
         changed += 1
         prev = (p.get_text(" ", strip=True) or "")[:60]
-        logger.info(f'2.1.6.4 - Unwrapped full-paragraph emphasis: "{prev}"')
+        args.logger.info(f'2.1.6.4 - Unwrapped full-paragraph emphasis: "{prev}"')
 
-    logger.info(f"2.1.6.4 - Done. Paragraphs fixed: {changed}")
+    args.logger.info(f"2.1.6.4 - Done. Paragraphs fixed: {changed}")
 
     # 2.1.6.5 Avoid use of <em> or <strong> in description lists
     """
@@ -8945,7 +8947,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Unwrapper <em>/<strong> under enhver <dl>, men rører ikke <code>/<pre>/<math> osv.
     - Idempotent.
     """
-    logger.info("2.1.6.5 - Avoid use of <em>/<strong> in description lists")
+    args.logger.info("2.1.6.5 - Avoid use of <em>/<strong> in description lists")
 
     changed = 0
     for dl in soup.find_all("dl"):
@@ -8961,15 +8963,15 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             node.unwrap()
             changed += 1
             if preview:
-                logger.info(f'2.1.6.5 - Unwrapped emphasis in <dl>: "{preview}"')
+                args.logger.info(f'2.1.6.5 - Unwrapped emphasis in <dl>: "{preview}"')
 
-    logger.info(f"2.1.6.5 - Done. Removed {changed} <em>/<strong> tag(s) inside <dl>.")
+    args.logger.info(f"2.1.6.5 - Done. Removed {changed} <em>/<strong> tag(s) inside <dl>.")
     
     # 2.1.6.6 Avoid use of <em> or <strong> in table headings
-    logger.info('2.1.6.6 Avoid use of <em> or <strong> in table headings')
+    args.logger.info('2.1.6.6 Avoid use of <em> or <strong> in table headings')
     for th in soup('th'):
         for emphasis in th(['em', 'strong']):
-            logger.info(f'2.1.6.6 - Unwrapping emphasis in table heading: {emphasis}')
+            args.logger.info(f'2.1.6.6 - Unwrapping emphasis in table heading: {emphasis}')
             emphasis.unwrap()
 
     # 2.1.6.7 Avoid use of <em> or <strong> in figures and figcaptions
@@ -8979,7 +8981,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Skipper <code>/<pre>/<math> osv.
     - Idempotent.
     """
-    logger.info("2.1.6.7 - Avoid use of <em>/<strong> in figures and figcaptions")
+    args.logger.info("2.1.6.7 - Avoid use of <em>/<strong> in figures and figcaptions")
 
     changed = 0
 
@@ -8997,7 +8999,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             node.unwrap()
             changed += 1
             if preview:
-                logger.info(f'2.1.6.7 - Unwrapped emphasis in figcaption: "{preview}"')
+                args.logger.info(f'2.1.6.7 - Unwrapped emphasis in figcaption: "{preview}"')
 
     # 2) tekst uttrukket fra figurer (fig-desc / figure-text / image-text)
     figtexts = [el for el in soup.find_all(True) if _is_figure_text_extract(el)]
@@ -9013,9 +9015,9 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             node.unwrap()
             changed += 1
             if preview:
-                logger.info(f'2.1.6.7 - Unwrapped emphasis in extracted figure text: "{preview}"')
+                args.logger.info(f'2.1.6.7 - Unwrapped emphasis in extracted figure text: "{preview}"')
 
-    logger.info(f"2.1.6.7 - Done. Removed {changed} <em>/<strong> tag(s).")
+    args.logger.info(f"2.1.6.7 - Done. Removed {changed} <em>/<strong> tag(s).")
 
     # 2.1.7 Non-breaking space
 
@@ -9025,7 +9027,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Setter NBSP mellom tall og enhet/valuta (f.eks. '12 kg', '25 °C', '10 %').
     - Skipper kode/math/style/script/… og er idempotent.
     """
-    logger.info('2.1.7 - Non-breaking space')
+    args.logger.info('2.1.7 - Non-breaking space')
 
     changed = 0
     for text in list(soup.find_all(string=True)):
@@ -9044,7 +9046,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             text.replace_with(NavigableString(s3))
             changed += 1
 
-    logger.info(f"2.1.7 - Done. Updated {changed} text node(s).")
+    args.logger.info(f"2.1.7 - Done. Updated {changed} text node(s).")
 
     # 2.1.8 Table of contents
     """
@@ -9054,11 +9056,11 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Ikke bruk ALL CAPS i TOC-tekst (senk bare ord som er helt i versaler, unntatt akronymer).
     - Sørg for at sidehenvisningen ligger i den ANDRE <span class="lic">.
     """
-    logger.info("2.1.8 - Table of contents")
+    args.logger.info("2.1.8 - Table of contents")
 
     containers = _iter_toc_containers(soup)
     if not containers:
-        logger.info("2.1.8 - No TOC container found.")
+        args.logger.info("2.1.8 - No TOC container found.")
     else:
         total_fixed = 0
         for toc in containers:
@@ -9070,7 +9072,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             # sikre listecontainer (og konverter tabell om nødvendig)
             ol, changed = _ensure_list_container(soup, toc)
             if changed:
-                logger.info("2.1.8 - Converted TOC to <ol> list without bullets")
+                args.logger.info("2.1.8 - Converted TOC to <ol> list without bullets")
 
             # normaliser hver <li>
             fixed_here = 0
@@ -9079,9 +9081,9 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                     fixed_here += 1
 
             total_fixed += fixed_here
-            logger.info(f"2.1.8 - Normalized {fixed_here} TOC item(s) in one container.")
+            args.logger.info(f"2.1.8 - Normalized {fixed_here} TOC item(s) in one container.")
 
-        logger.info(f"2.1.8 - Done. Total TOC items normalized: {total_fixed}")
+        args.logger.info(f"2.1.8 - Done. Total TOC items normalized: {total_fixed}")
         
     # 2.1.8.1 TOC at the beginning of the book
     """
@@ -9090,18 +9092,18 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Normaliser whitespace i TOC (multi-spaces -> enkel space)
     - Sørg for nøyaktig én space mellom <span class="lic">-elementer i <a>
     """
-    logger.info("2.1.8.1 - TOC at the beginning of the book")
+    args.logger.info("2.1.8.1 - TOC at the beginning of the book")
 
     tocs = [el for el in soup.find_all(True) if _is_toc_container(el)]
     if not tocs:
-        logger.info("2.1.8.1 - No TOC container found.")
+        args.logger.info("2.1.8.1 - No TOC container found.")
 
     else:
         processed = 0
         for toc in tocs:
             et = (toc.get("epub:type") or "").lower()
             if "frontmatter" not in et and "toc" in et:
-                logger.warning(f"2.1.8.1 - TOC not marked as 'frontmatter' (epub:type='{et}').")
+                args.logger.warning(f"2.1.8.1 - TOC not marked as 'frontmatter' (epub:type='{et}').")
 
             # Finn toppnivå-liste
             ol = toc.find(["ol", "ul"], recursive=False)
@@ -9109,7 +9111,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 # prøv dypt
                 ol = toc.find(["ol", "ul"])
                 if ol is None:
-                    logger.warning("2.1.8.1 - No list (<ol>/<ul>) found inside TOC; skipping container.")
+                    args.logger.warning("2.1.8.1 - No list (<ol>/<ul>) found inside TOC; skipping container.")
                     continue
 
             # Konverter <ul> -> <ol> om nødvendig
@@ -9144,10 +9146,10 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 if _ensure_single_space_between_spans(a):
                     li_fixed += 1
 
-            logger.info(f"2.1.8.1 - Normalized spacing for {li_fixed} TOC item(s).")
+            args.logger.info(f"2.1.8.1 - Normalized spacing for {li_fixed} TOC item(s).")
             processed += 1
 
-        logger.info(f"2.1.8.1 - Done. Processed {processed} TOC container(s).")
+        args.logger.info(f"2.1.8.1 - Done. Processed {processed} TOC container(s).")
 
     # 2.1.8.2 TOC at the beginning of each chapter
     """
@@ -9158,7 +9160,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Konverter tabeller til lister (uten sidetall-spans).
     - Normaliser evt. spacing mellom eksisterende <span class="lic"> (ingen påtvingelse av slike spans).
     """
-    logger.info("2.1.8.2 - Chapter-level TOCs")
+    args.logger.info("2.1.8.2 - Chapter-level TOCs")
 
     chapters = _iter_chapter_like_containers(soup)
     total_lists = 0
@@ -9225,9 +9227,9 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                     fixed += 1
 
             total_lists += 1
-            logger.info(f"2.1.8.2 - Normalized chapter TOC list (items fixed for spacing: {fixed}).")
+            args.logger.info(f"2.1.8.2 - Normalized chapter TOC list (items fixed for spacing: {fixed}).")
 
-    logger.info(f"2.1.8.2 - Done. Chapter TOCs processed: {total_lists}")
+    args.logger.info(f"2.1.8.2 - Done. Chapter TOCs processed: {total_lists}")
 
     # 2.1.9 Backmatter
     
@@ -9237,16 +9239,16 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Indeks/register i slutten av boka skal være listemarkup, ikke tabell.
     - Lister over bildekrediteringer i slutten av boka skal fjernes.
     """
-    logger.info("2.1.9.1 - Indexes and registers")
+    args.logger.info("2.1.9.1 - Indexes and registers")
 
     # 1) Fjern bildekrediteringer (konservativt)
-    _remove_image_credits_in_backmatter(soup, logger)
+    _remove_image_credits_in_backmatter(soup, args.logger)
 
     # 2) Finn indeks-/registercontainere og konverter tabeller til lister
     converted = 0
     containers = [el for el in soup.find_all(True) if _is_index_container(el)]
     if not containers:
-        logger.info("2.1.9.1 - No obvious index/register container found.")
+        args.logger.info("2.1.9.1 - No obvious index/register container found.")
 
     for box in containers:
         # Konverter bare tabeller (idempotent; kjøring #2 finner ingen tabeller)
@@ -9254,7 +9256,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             _table_to_index_list(soup, table)
             converted += 1
 
-    logger.info(f"2.1.9.1 - Converted {converted} table(s) in index/register to lists.")
+    args.logger.info(f"2.1.9.1 - Converted {converted} table(s) in index/register to lists.")
 
 
     # 2.1.9.2 Answer sections for tasks
@@ -9263,14 +9265,14 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     2.1.9.2 Answer sections for tasks
     - Fjern/reloker 'task'-seksjoner fra backmatter.
     - La 'answer' (Fasit) og 'reference' stå igjen.
-    - Andre ukjente seksjoner lar vi stå, men logger (konservativt).
+    - Andre ukjente seksjoner lar vi stå, men args.logger (konservativt).
     """
-    logger.info("2.1.9.2 - Answer sections for tasks")
-    llm = _ensure_llm_client(logger, use_llm) if use_llm else None
+    args.logger.info("2.1.9.2 - Answer sections for tasks")
+    llm = _ensure_llm_client(args.logger, use_llm) if use_llm else None
 
     backmatters = _find_backmatters(soup)
     if not backmatters:
-        logger.info("2.1.9.2 - No backmatter container found.")
+        args.logger.info("2.1.9.2 - No backmatter container found.")
 
     else:
         moved, kept_answer, kept_ref, kept_other = 0, 0, 0, 0
@@ -9278,9 +9280,9 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         for bm in backmatters:
             # Vi vurderer direkte blokkbarn som typisk er seksjoner i backmatter
             for child in list(bm.find_all(["section","article","div"], recursive=False)):
-                label = _classify_section(child, llm=llm, logger=logger)
+                label = _classify_section(child, llm=llm, logger=args.logger)
                 if label == "task":
-                    if _move_out_of_backmatter(child, bm, logger):
+                    if _move_out_of_backmatter(child, bm, args.logger):
                         moved += 1
                     continue
                 if label == "answer":
@@ -9292,9 +9294,9 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 # annet: la stå, men si ifra – spesifikasjonen er vag om "any reference sections that follow"
                 kept_other += 1
                 title = _get_heading_text(child)
-                logger.debug(f'2.1.9.2 - Keeping unknown backmatter section: "{title or child.name}" (types={_epub_types(child)})')
+                args.logger.debug(f'2.1.9.2 - Keeping unknown backmatter section: "{title or child.name}" (types={_epub_types(child)})')
 
-        logger.info(
+        args.logger.info(
             "2.1.9.2 - Done. Moved=%d, kept answers=%d, kept references=%d, kept other=%d",
             moved, kept_answer, kept_ref, kept_other
         )
@@ -9302,10 +9304,10 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     # 2.1.10 Layout challenges
     """
     2.1.10 Layout challenges: flagg mistenkelige layouter for manuell avklaring.
-    Endrer ikke DOM; logger bare WARN med korte utdrag.
+    Endrer ikke DOM; args.logger bare WARN med korte utdrag.
     """
-    logger.info("2.1.10 - Layout challenges (audit only)")
-    llm = _ensure_llm_client(logger, use_llm) if use_llm else None
+    args.logger.info("2.1.10 - Layout challenges (audit only)")
+    llm = _ensure_llm_client(args.logger, use_llm) if use_llm else None
 
     issues = 0
 
@@ -9333,22 +9335,22 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 if lab in {"list","poem","blockquote"} and conf >= 0.6:
                     label = lab
             except Exception as e:
-                logger.debug(f"2.1.10 - LLM unavailable ({e}); continuing without it.")
+                args.logger.debug(f"2.1.10 - LLM unavailable ({e}); continuing without it.")
 
         if label == "list" or (label is None and try_list):
-            logger.warning('2.1.10 [LIST?] %s — "%s"', _css_path(el), _snippet(el))
+            args.logger.warning('2.1.10 [LIST?] %s — "%s"', _css_path(el), _snippet(el))
             issues += 1
         if label == "poem" or (label is None and try_poem):
-            logger.warning('2.1.10 [POEM?] %s — "%s"', _css_path(el), _snippet(el))
+            args.logger.warning('2.1.10 [POEM?] %s — "%s"', _css_path(el), _snippet(el))
             issues += 1
         if label == "blockquote" or (label is None and try_quote):
-            logger.warning('2.1.10 [BLOCKQUOTE?] %s — "%s"', _css_path(el), _snippet(el))
+            args.logger.warning('2.1.10 [BLOCKQUOTE?] %s — "%s"', _css_path(el), _snippet(el))
             issues += 1
 
     # 2) Layout-tabeller
     for tbl in soup.find_all("table"):
         if _is_layout_table(tbl):
-            logger.warning('2.1.10 [LAYOUT-TABLE?] %s — rows=%d, cells=%d',
+            args.logger.warning('2.1.10 [LAYOUT-TABLE?] %s — rows=%d, cells=%d',
                            _css_path(tbl),
                            len(tbl.find_all("tr")),
                            len(tbl.find_all("td")))
@@ -9357,7 +9359,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     # 3) Suspekt inline-CSS
     for el in soup.find_all(True, style=True):
         if _has_suspect_inline_style(el):
-            logger.warning('2.1.10 [INLINE-CSS?] %s — style="%s"',
+            args.logger.warning('2.1.10 [INLINE-CSS?] %s — style="%s"',
                            _css_path(el), (el.get("style") or "").strip()[:120])
             issues += 1
 
@@ -9365,11 +9367,11 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     for p in soup.find_all("p"):
         brs = p.find_all("br")
         if len(brs) >= 3:
-            logger.warning('2.1.10 [MANY <br>?] %s — %d <br> — "%s"',
+            args.logger.warning('2.1.10 [MANY <br>?] %s — %d <br> — "%s"',
                            _css_path(p), len(brs), _snippet(p))
             issues += 1
 
-    logger.info("2.1.10 - Audit complete. Potential issues flagged: %d", issues)
+    args.logger.info("2.1.10 - Audit complete. Potential issues flagged: %d", issues)
 
     # 2.1.11 Use of <hr> or <br>
     """
@@ -9379,7 +9381,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - I lister: kollaps flere <br> på rad til én.
     - Skipp pre/code/math/script/style/textarea.
     """
-    logger.info("2.1.11 - Use of <hr> or <br>")
+    args.logger.info("2.1.11 - Use of <hr> or <br>")
 
     removed_hr = 0
     fixed_br   = 0
@@ -9416,7 +9418,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             br.decompose()
         fixed_br += 1
 
-    logger.info("2.1.11 - Done. Removed hr=%d, fixed br=%d, kept br in lists=%d",
+    args.logger.info("2.1.11 - Done. Removed hr=%d, fixed br=%d, kept br in lists=%d",
                 removed_hr, fixed_br, kept_br)
 
     # 2.1.11.1 Use of <br> in mathematics books
@@ -9426,9 +9428,9 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
       - mellom to påfølgende utregninger (<math> … <math>).
     Idempotent; endrer ikke protected kontekster.
     """
-    logger.info('2.1.11.1 - Use of <br> in mathematics books')
+    args.logger.info('2.1.11.1 - Use of <br> in mathematics books')
     if not args.mathematics:
-        logger.info("2.1.11.1 - Not a mathematics book; skipping.")
+        args.logger.info("2.1.11.1 - Not a mathematics book; skipping.")
     else:
         inserted = 0
         collapsed = 0
@@ -9448,7 +9450,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             if parent:
                 collapsed += _collapse_adjacent_brs(parent)
 
-        logger.info("2.1.11.1 - Done. Inserted br=%d, collapsed duplicates=%d", inserted, collapsed)
+        args.logger.info("2.1.11.1 - Done. Inserted br=%d, collapsed duplicates=%d", inserted, collapsed)
 
     # 2.1.12 OCR
     # This requirement is not implementable
@@ -9459,11 +9461,11 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Logger også noder med ikke-NFC (uten å endre).
     - Valgfritt: bruk LLM til å bekrefte et lite utvalg funn.
     """
-    logger.info("2.1.12 - OCR (audit)")
+    args.logger.info("2.1.12 - OCR (audit)")
 
     total_tokens, samples = _collect_tokens(soup)
     if total_tokens == 0:
-        logger.info("2.1.12 - No tokens found; skipping audit.")
+        args.logger.info("2.1.12 - No tokens found; skipping audit.")
 
     else:
         suspicious = []
@@ -9477,7 +9479,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             if unicodedata.normalize("NFC", s) != s and id(t) not in nfc_nodes_logged:
                 nfc_nodes_logged.add(id(t))
                 nfc_path = _css_path(t.parent) if getattr(t, "parent", None) else "<orphan>"
-                logger.warning('2.1.12 - Non-NFC text at %s: "%s"', nfc_path, s[:120].replace("\n", " "))
+                args.logger.warning('2.1.12 - Non-NFC text at %s: "%s"', nfc_path, s[:120].replace("\n", " "))
 
         # Heuristisk mistenkelige tokens
         for tok, node, ctx in samples:
@@ -9491,7 +9493,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         llm_confirmed = 0
         if use_llm and suspicious:
             try:
-                llm = _ensure_llm_client(logger, use_llm=True)
+                llm = _ensure_llm_client(args.logger, use_llm=True)
                 subset = suspicious[:50]  # spør om et lite utvalg
                 for tok, reason, node, ctx in subset:
                     try:
@@ -9505,27 +9507,27 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                     except Exception:
                         pass
             except Exception as e:
-                logger.warning(f"2.1.12 - LLM unavailable ({e}); continuing without LLM).")
+                args.logger.warning(f"2.1.12 - LLM unavailable ({e}); continuing without LLM).")
 
         # Grovt risikomål (ikke en feilrate!)
         risk = len(suspicious) / max(1, total_tokens)
-        logger.info("2.1.12 - Tokens scanned: %d, suspicious (heuristic): %d (%.5f)",
+        args.logger.info("2.1.12 - Tokens scanned: %d, suspicious (heuristic): %d (%.5f)",
                     total_tokens, len(suspicious), risk)
 
         if use_llm and suspicious:
-            logger.info("2.1.12 - LLM confirmed suspicious subset: %d/%d", llm_confirmed, min(50, len(suspicious)))
+            args.logger.info("2.1.12 - LLM confirmed suspicious subset: %d/%d", llm_confirmed, min(50, len(suspicious)))
 
         # Logg konkrete smaksprøver
         for i, (tok, reason, node, ctx) in enumerate(suspicious[:30], 1):
             ctx_path = _css_path(node.parent) if getattr(node, "parent", None) else "<orphan>"
-            logger.warning('2.1.12 - Suspicious token #%d [%s] at %s: token="%s", context="…%s…" ',
+            args.logger.warning('2.1.12 - Suspicious token #%d [%s] at %s: token="%s", context="…%s…" ',
                            i, reason, ctx_path, tok, ctx.replace("\n", " ")[:140])
 
         if risk > 0.001:  # 0.1% heuristisk terskel (99.9%) – strengere enn 99.95% for å få tidlig varsling
-            logger.warning("2.1.12 - Heuristic OCR risk above threshold (%.3f%%). Review recommended.",
+            args.logger.warning("2.1.12 - Heuristic OCR risk above threshold (%.3f%%). Review recommended.",
                            100*risk)
 
-        logger.info("2.1.12 - Audit complete (no DOM changes).")
+        args.logger.info("2.1.12 - Audit complete (no DOM changes).")
 
     # 2.2 Thematic grouping of content
     """
@@ -9539,7 +9541,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Hopper over <nav>, <figcaption>, <table>/<thead>/<tbody>/<tfoot>.
     """
 
-    logger.info("2.2 - Thematic grouping of content")
+    args.logger.info("2.2 - Thematic grouping of content")
     headings = list(soup.find_all(re.compile(r'^h[1-6]$', re.I)))
     created = 0
     adjusted = 0
@@ -9555,14 +9557,14 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 first.extract()
                 sec.insert_before(first)
                 adjusted += 1
-                logger.info('2.2 - Moved pagebreak before chapter section to make heading first child.')
+                args.logger.info('2.2 - Moved pagebreak before chapter section to make heading first child.')
 
             # Sørg for aria-labelledby på kapittel-seksjonen
             hid = h.get("id")
             if hid and sec.get("aria-labelledby") != hid:
                 sec["aria-labelledby"] = hid
                 adjusted += 1
-                logger.info('2.2 - Set aria-labelledby="%s" on chapter section.', hid)
+                args.logger.info('2.2 - Set aria-labelledby="%s" on chapter section.', hid)
 
             # Ikke lag en ny auto-section
             continue
@@ -9601,13 +9603,13 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             sib = nxt
 
         created += 1
-        logger.info('2.2 - Created auto <section> for "%s".',
+        args.logger.info('2.2 - Created auto <section> for "%s".',
                     (h.get_text(" ", strip=True) or "")[:80])
 
     # Flate ut overflødige wrapper-seksjoner til slutt
-    flattened = _flatten_redundant_sections(soup, logger)
+    flattened = _flatten_redundant_sections(soup, args.logger)
 
-    logger.info(
+    args.logger.info(
         "2.2 - Done. Auto sections created: %d, chapter sections adjusted: %d, redundant sections flattened: %d",
         created, adjusted, flattened
     )
@@ -9620,7 +9622,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Rør ikke rene 'container'-seksjoner (assessments/exercises/tasks) – vi går på de enkelte elementene.
     - Idempotent; flater ut overflødige wrapper-seksjoner etterpå.
     """
-    logger.info("2.2.1 - Use of <section> within tasks")
+    args.logger.info("2.2.1 - Use of <section> within tasks")
 
     wrapped = 0
     skipped_no_heading = 0
@@ -9646,13 +9648,13 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             continue
 
         # Wrap
-        if _wrap_as_task_section(soup, el, logger):
+        if _wrap_as_task_section(soup, el, args.logger):
             wrapped += 1
 
     # Rydd opp tomme wrapper-sections
-    flattened = _flatten_redundant_sections(soup, logger)
+    flattened = _flatten_redundant_sections(soup, args.logger)
 
-    logger.info(
+    args.logger.info(
         "2.2.1 - Done. Wrapped=%d, already_ok=%d, skipped(no heading)=%d, flattened=%d",
         wrapped, already_ok, skipped_no_heading, flattened
     )
@@ -9667,7 +9669,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Fyll inn hvis alt mangler/er søppel. Bevar gode eksisterende ALT-tekster.
     - Normaliser eksisterende generiske ALT til lowercase.
     """
-    logger.info("2.3.1 - Alt tag")
+    args.logger.info("2.3.1 - Alt tag")
 
     fixed, normalized, kept = 0, 0, 0
 
@@ -9701,9 +9703,9 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         label = _classify_generic_alt(img)
         img["alt"] = label
         fixed += 1
-        logger.info('2.3.1 - Set alt="%s" for <img src="%s">', label, src[:120])
+        args.logger.info('2.3.1 - Set alt="%s" for <img src="%s">', label, src[:120])
 
-    logger.info("2.3.1 - Done. Set=%d, normalized=%d, kept=%d", fixed, normalized, kept)
+    args.logger.info("2.3.1 - Done. Set=%d, normalized=%d, kept=%d", fixed, normalized, kept)
 
     # 2.3.2 Extraction of text in figures
     """
@@ -9735,11 +9737,11 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         cand = path.join(base_dir, rel)
         return cand if path.exists(cand) else None
 
-    logger.info("2.3.2 - Extraction of text in figures")
+    args.logger.info("2.3.2 - Extraction of text in figures")
 
     ocr_enabled = bool(use_llm) and callable(ocr_rpc) and bool(input_base_dir)
     if not ocr_enabled:
-        logger.debug("2.3.2 - OCR disabled (use_llm=%s, ocr_rpc=%s, input_base_dir=%s)",
+        args.logger.debug("2.3.2 - OCR disabled (use_llm=%s, ocr_rpc=%s, input_base_dir=%s)",
                      bool(use_llm), bool(callable(ocr_rpc)), bool(input_base_dir))
 
     removed = 0
@@ -9756,7 +9758,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             # Normaliser ev. eksisterende boks
             box = fig.find("aside", class_="fig-desc", recursive=False)
             if box and not _fig_text_box_is_empty(box):
-                if _normalize_figure_text_box(soup, box, logger):
+                if _normalize_figure_text_box(soup, box, args.logger):
                     normalized += 1
             continue
 
@@ -9787,7 +9789,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
         # 4) Hvis boks finnes med innhold → normaliser
         if box and not _fig_text_box_is_empty(box):
-            if _normalize_figure_text_box(soup, box, logger):
+            if _normalize_figure_text_box(soup, box, args.logger):
                 normalized += 1
             continue
 
@@ -9795,13 +9797,13 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         if ocr_enabled:
             img_path = _resolve_image_path(img.get("src"), input_base_dir)
             if not img_path:
-                logger.debug("2.3.2 - Could not resolve image path for OCR: %s", img.get("src"))
+                args.logger.debug("2.3.2 - Could not resolve image path for OCR: %s", img.get("src"))
                 continue
 
             try:
                 text = ocr_rpc(img_path)  # forventer Optional[str]
             except Exception as e:
-                logger.warning("2.3.2 - OCR RPC failed for %s: %s", img_path, e)
+                args.logger.warning("2.3.2 - OCR RPC failed for %s: %s", img_path, e)
                 text = None
 
             if text:
@@ -9822,9 +9824,9 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 box["data-ocr"] = "true"
                 ocred += 1
                 # Rydd etterpå
-                _normalize_figure_text_box(soup, box, logger)
+                _normalize_figure_text_box(soup, box, args.logger)
 
-    logger.info("2.3.2 - Done. Removed boxes=%d, normalized boxes=%d, OCR-added boxes=%d",
+    args.logger.info("2.3.2 - Done. Removed boxes=%d, normalized boxes=%d, OCR-added boxes=%d",
                 removed, normalized, ocred)
 
     # 2.3.2.1 Extraction of text from figures in mathematics books
@@ -9835,9 +9837,9 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
       <figure> og som umiddelbar søsken etter <figure>.
     - Idempotent.
     """
-    logger.info("2.3.2.1 - Extraction of text from figures in mathematics books")
+    args.logger.info("2.3.2.1 - Extraction of text from figures in mathematics books")
     if not is_mathematics_book:
-        logger.info("2.3.2.1 - Not a mathematics book; skipping.")
+        args.logger.info("2.3.2.1 - Not a mathematics book; skipping.")
 
     else:
         removed = 0
@@ -9862,7 +9864,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                     inner.decompose()
                     removed += 1
 
-        logger.info("2.3.2.1 - Done. Removed figure-text boxes: %d", removed)
+        args.logger.info("2.3.2.1 - Done. Removed figure-text boxes: %d", removed)
 
     # 2.3.3 Aside element for image description to be added later
     """
@@ -9872,7 +9874,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Normaliser eksisterende bokser (klassse/innhold/id).
     - Bruk O(1) id-generering basert på forhåndsinnsamlet used_ids.
     """
-    logger.info("2.3.3 - Aside element for image description (prodnote)")
+    args.logger.info("2.3.3 - Aside element for image description (prodnote)")
 
     # 1) Samle alle brukte id-er én gang (O(N))
     used_ids = {el.get("id") for el in soup.find_all(True, id=True)}
@@ -9971,7 +9973,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         fig.append(aside)
         added += 1
 
-    logger.info("2.3.3 - Done. Added=%d, normalized=%d", added, normalized)
+    args.logger.info("2.3.3 - Done. Added=%d, normalized=%d", added, normalized)
 
     # 2.3.4 Figcaptions
     """
@@ -9982,7 +9984,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Ikke rør ved blokkelement-strukturer
     - Idempotent
     """
-    logger.info("2.3.4 - Figcaptions")
+    args.logger.info("2.3.4 - Figcaptions")
 
     removed_emstrong = 0
     removed_empty_p = 0
@@ -10025,7 +10027,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                     t.replace_with(NavigableString(ns))
                     ws_normalized += 1
 
-    logger.info(
+    args.logger.info(
         "2.3.4 - Done. removed <em>/<strong>=%d, removed empty <p>=%d, unwrapped single <p>=%d, ws-normalized-nodes=%d",
         removed_emstrong, removed_empty_p, single_unwrapped, ws_normalized
     )
@@ -10037,12 +10039,12 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Ikke flytt i matematikkbøker.
     - Idempotent; bevarer rekkefølge; rører kun toppnivå-figurer i <section>.
     """
-    logger.info("2.3.5 - Placement of figure elements")
+    args.logger.info("2.3.5 - Placement of figure elements")
 
     if not args.relocate:
-        logger.info("2.3.5 - Relocation disabled (--no-relocate).")
+        args.logger.info("2.3.5 - Relocation disabled (--no-relocate).")
     elif args.mathematics or args.science: # Covers 2.3.6
-        logger.info("2.3.5 - Mathematics book; figures are not relocated.")
+        args.logger.info("2.3.5 - Mathematics book; figures are not relocated.")
     else:
         moved_total = 0
         sections = soup.find_all("section")
@@ -10098,7 +10100,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 fig["data-relocated-figure"] = "true"
                 moved_total += 1
 
-        logger.info("2.3.5 - Done. Figures moved: %d", moved_total)
+        args.logger.info("2.3.5 - Done. Figures moved: %d", moved_total)
 
     # 2.3.5.1 Figures at the start of each chapter, placed before the chapter heading
     """
@@ -10109,12 +10111,12 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Ikke flytt i matematikkbøker.
     - Idempotent via data-relocated-chapter-figure="true".
     """
-    logger.info("2.3.5.1 - Figures before chapter headings")
+    args.logger.info("2.3.5.1 - Figures before chapter headings")
 
     if not args.relocate:
-        logger.info("2.3.5.1 - Relocation disabled (--no-relocate).")
+        args.logger.info("2.3.5.1 - Relocation disabled (--no-relocate).")
     elif args.mathematics:
-        logger.info("2.3.5.1 - Mathematics book; figures are not relocated.")
+        args.logger.info("2.3.5.1 - Mathematics book; figures are not relocated.")
     else:
         moved = 0
         inserted_msgs = 0
@@ -10184,7 +10186,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 # Det står annet innhold igjen; ikke legg inn “blank side”-melding
                 pass
 
-        logger.info("2.3.5.1 - Done. Figures moved: %d, messages inserted: %d", moved, inserted_msgs)
+        args.logger.info("2.3.5.1 - Done. Figures moved: %d, messages inserted: %d", moved, inserted_msgs)
 
     # 2.3.6 Figures in science books
     # Implemented in 2.3.5
@@ -10201,9 +10203,9 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Behold <figcaption> og prodnote (<aside epub:type="z3998:production">) inne i <figure>.
     - Idempotent.
     """
-    logger.info("2.3.7 - Figures in mathematics books")
+    args.logger.info("2.3.7 - Figures in mathematics books")
     if not args.mathematics:
-        logger.info("2.3.7 - Not a mathematics book; skipping.")
+        args.logger.info("2.3.7 - Not a mathematics book; skipping.")
     else:
         moved_out = 0
         removed_figtext = 0
@@ -10274,7 +10276,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             # Flush eventuell oppsamlet løs tekst til slutt
             flush_text_buf()
 
-        logger.info(
+        args.logger.info(
             "2.3.7 - Done. moved_out=%d, removed_figtext_boxes=%d, wrapped_text_nodes=%d",
             moved_out, removed_figtext, wrapped_text
         )
@@ -10296,10 +10298,10 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         kall table_rpc(image_path) og erstatt figuren med returnert <table>. Merk med data-auto-table="spreadsheet".
     - Idempotent: figurer merkes data-table-extracted="true" etter vellykket konvertering.
     """
-    logger.info("2.3.7.1 - Spreadsheets → <table> (math only)")
+    args.logger.info("2.3.7.1 - Spreadsheets → <table> (math only)")
 
     if not args.mathematics:
-        logger.info("2.3.7.1 - Not a mathematics book; skipping.")
+        args.logger.info("2.3.7.1 - Not a mathematics book; skipping.")
     else:
         converted_from_real = 0
         converted_from_img  = 0
@@ -10367,7 +10369,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
             img_path = _resolve_image_path(img0.get("src"), input_base_dir)
             if not img_path:
-                logger.debug("2.3.7.1 - Could not resolve spreadsheet image path: %s", img0.get("src"))
+                args.logger.debug("2.3.7.1 - Could not resolve spreadsheet image path: %s", img0.get("src"))
                 skipped_no_signal += 1
                 continue
 
@@ -10375,7 +10377,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             try:
                 html = table_rpc(img_path)
             except Exception as e:
-                logger.warning("2.3.7.1 - table_rpc failed for %s: %s", img_path, e)
+                args.logger.warning("2.3.7.1 - table_rpc failed for %s: %s", img_path, e)
                 failed_rpc += 1
                 continue
 
@@ -10403,7 +10405,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             fig.decompose()
             converted_from_img += 1
 
-        logger.info("2.3.7.1 - Done. From real table=%d, From image RPC=%d, Skipped=%d, RPC failed=%d",
+        args.logger.info("2.3.7.1 - Done. From real table=%d, From image RPC=%d, Skipped=%d, RPC failed=%d",
                     converted_from_real, converted_from_img, skipped_no_signal, failed_rpc)
 
     # 2.3.8 Comics, comic strips and graphic novels
@@ -10419,7 +10421,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Hvis use_llm & comic_text_rpc: hent tekstlinjer og fyll inn (én <p> pr. linje).
     - I mattebøker: ikke trekk ut – behold/lag prodnote med '¤' som plassholder.
     """
-    logger.info("2.3.8 - Comics / comic strips / graphic novels")
+    args.logger.info("2.3.8 - Comics / comic strips / graphic novels")
 
     processed = 0
     created_aside = 0
@@ -10473,7 +10475,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 try:
                     result = comic_text_rpc(img_path)  # kan være List[str] eller str/None
                 except Exception as e:
-                    logger.warning("2.3.8 - comic_text_rpc failed for %s: %s", img_path, e)
+                    args.logger.warning("2.3.8 - comic_text_rpc failed for %s: %s", img_path, e)
                     result = None
                 lines = []
                 if isinstance(result, (list, tuple)):
@@ -10502,7 +10504,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             aside.append("¤")
             aside["data-comic"] = "true"
 
-    logger.info(
+    args.logger.info(
         "2.3.8 - Done. processed=%d, created_aside=%d, normalized_to_paragraphs=%d, ocr_added=%d, rpc_skipped=%d",
         processed, created_aside, normalized_into_paragraphs, ocred, skipped_rpc
     )
@@ -10516,7 +10518,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Ikke splitt <ol>, ikke bruk start-attributt for dette tilfellet
     - Idempotent: overskriver bare value når den ikke samsvarer
     """
-    logger.info("2.4.1.1 - Lists with missing sequential values")
+    args.logger.info("2.4.1.1 - Lists with missing sequential values")
 
     processed = 0
     adjusted  = 0
@@ -10588,7 +10590,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
         processed += 1
 
-    logger.info(
+    args.logger.info(
         "2.4.1.1 - Done. processed=%d, adjusted_li_values=%d, skipped_inconclusive=%d",
         processed, adjusted, skipped_inconclusive
     )
@@ -10603,7 +10605,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Fjern overflødig type/start hvis tall og start=length uten behov.
     - Idempotent; fjerner reversed hvis lista er økende og reversed var satt (konservativ opprydding).
     """
-    logger.info("2.4.1.2 - Lists with reversed order")
+    args.logger.info("2.4.1.2 - Lists with reversed order")
 
     marked_reversed = 0
     unset_reversed  = 0
@@ -10656,7 +10658,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
         skipped += 1
 
-    logger.info(
+    args.logger.info(
         "2.4.1.2 - Done. set_reversed=%d, unset_reversed=%d, skipped=%d",
         marked_reversed, unset_reversed, skipped
     )
@@ -10669,7 +10671,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Hopper over lister med <li value=> (de håndteres i 2.4.1.1).
     - Idempotent.
     """
-    logger.info("2.4.1 - Ordered lists <ol>")
+    args.logger.info("2.4.1 - Ordered lists <ol>")
 
     processed = 0
     stripped = 0
@@ -10759,12 +10761,12 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
         processed += 1
         if changed_attrs:
-            logger.debug(
+            args.logger.debug(
                 "2.4.1 - <ol id=%r> type=%s start=%s reversed=%s",
                 ol.get("id"), ol.get("type"), ol.get("start"), "reversed" in ol.attrs
             )
 
-    logger.info(
+    args.logger.info(
         "2.4.1 - Done. processed=%d, stripped_li=%d, skipped_value_lists=%d, unchanged=%d",
         processed, stripped, skipped_value, unchanged
     )
@@ -10782,7 +10784,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Konverter <ul> → <ol> når dette oppdages.
     - Rører ikke innholdet i <li>.
     """
-    logger.info("2.4.1.3 - List with non-standard numbering")
+    args.logger.info("2.4.1.3 - List with non-standard numbering")
 
     processed = 0
     converted_ul = 0
@@ -10813,7 +10815,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 converted_ul += 1
 
             # Sett list-type none (klasse + style)
-            _ensure_listtype_none(lst, logger)
+            _ensure_listtype_none(lst, args.logger)
 
             processed += 1
 
@@ -10822,7 +10824,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             if lst.name == "ol" and "list-type-none" in (lst.get("class") or []):
                 already_ok += 1
 
-    logger.info("2.4.1.3 - Done. Non-standard lists normalized: %d, ul→ol converted: %d, already_ok: %d",
+    args.logger.info("2.4.1.3 - Done. Non-standard lists normalized: %d, ul→ol converted: %d, already_ok: %d",
                 processed, converted_ul, already_ok)
 
     # 2.4.1.4 Jointly given answers in lists
@@ -10837,9 +10839,9 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Korriger videre nummerering med LI@value slik at bokstavene forblir korrekte.
     - Idempotent.
     """
-    logger.info("2.4.1.4 - Jointly given answers in lists")
+    args.logger.info("2.4.1.4 - Jointly given answers in lists")
     if not args.mathematics:
-        logger.info("2.4.1.4 - Not a mathematics book; skipping.")
+        args.logger.info("2.4.1.4 - Not a mathematics book; skipping.")
     else:
         lists_seen = adjusted_lists = merged_items = valued_set = 0
 
@@ -10905,7 +10907,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             if merges_before > 0:
                 adjusted_lists += 1
 
-        logger.info(
+        args.logger.info(
             "2.4.1.4 - Done. Lists seen=%d, lists adjusted=%d, items merged=%d, li@value set=%d",
             lists_seen, adjusted_lists, merged_items, valued_set
         )
@@ -10917,7 +10919,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Normaliser kuleløse lister til class="list-unstyled" (konverter fra inline style/class).
     - Idempotent; rører ikke nav/TOC eller beskyttede blokker.
     """
-    logger.info("2.4.2 - Unordered lists <ul>")
+    args.logger.info("2.4.2 - Unordered lists <ul>")
 
     ul_count = 0
     li_cleaned = 0
@@ -10942,7 +10944,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         if _normalize_plain_ul(ul):
             ul_plain_normalized += 1
 
-    logger.info("2.4.2 - Done. <ul> scanned=%d, <li> cleaned=%d, plain <ul> normalized=%d",
+    args.logger.info("2.4.2 - Done. <ul> scanned=%d, <li> cleaned=%d, plain <ul> normalized=%d",
                 ul_count, li_cleaned, ul_plain_normalized)
 
     # 2.4.3 Avoid the use of <p> as children of <li> elements
@@ -10953,7 +10955,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Skip hvis <li> har andre blokkelementer (særlig nested lists).
     - Idempotent.
     """
-    logger.info("2.4.3 - Avoid <p> as direct children of <li>")
+    args.logger.info("2.4.3 - Avoid <p> as direct children of <li>")
 
     scanned = 0
     li_changed = 0
@@ -10989,7 +10991,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 p.unwrap()
                 li_changed += 1
 
-    logger.info("2.4.3 - Done. <li> scanned=%d, changed=%d, <br> inserted=%d",
+    args.logger.info("2.4.3 - Done. <li> scanned=%d, changed=%d, <br> inserted=%d",
                 scanned, li_changed, br_inserted)
                 
     # 2.4.4 Description Lists
@@ -11000,14 +11002,14 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Legg til heading ved behov, med språkbasert tittel og riktig nivå.
     - Sørg for ': ' på slutten av hver <dt>.
     """
-    logger.info("2.4.4 - Description Lists")
+    args.logger.info("2.4.4 - Description Lists")
 
     lang = _doc_lang(soup)
     default_title = _GLOSSARY_TITLES.get(lang, _GLOSSARY_TITLES["no"])
 
     dls = soup.find_all("dl")
     if not dls:
-        logger.info("2.4.4 - No <dl> found.")
+        args.logger.info("2.4.4 - No <dl> found.")
     else:
         asides_touched = set()
         wrapped = 0
@@ -11060,7 +11062,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 aside.insert(0, h)
                 added_headings += 1
 
-        logger.info(
+        args.logger.info(
             "2.4.4 - Done. dl wrapped=%d, aside classes set=%d, headings added=%d, dt fixed=%d",
             wrapped, classes_set, added_headings, dt_fixed
         )
@@ -11072,11 +11074,11 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Fjern IPA fra <dd>.
     - Idempotent og bevarer øvrig markup.
     """
-    logger.info("2.4.4.1 - Phonetics in description lists")
+    args.logger.info("2.4.4.1 - Phonetics in description lists")
 
     dls = soup.find_all("dl")
     if not dls:
-        logger.info("2.4.4.1 - No <dl> found.")
+        args.logger.info("2.4.4.1 - No <dl> found.")
 
     else:
         moved = 0
@@ -11140,7 +11142,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                     if src_dd is not None:
                         _remove_first_literal_occurrence(src_dd, full)
 
-        logger.info("2.4.4.1 - Done. Moved=%d, normalized=%d, pairs_without_ipa=%d", moved, normalized, already)
+        args.logger.info("2.4.4.1 - Done. Moved=%d, normalized=%d, pairs_without_ipa=%d", moved, normalized, already)
 
     """
     2.4.4.2 Relocation of description lists
@@ -11150,9 +11152,9 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Plasser container: etter (figure/aside), før tasks; ellers på slutten av seksjonen.
     - Idempotent: flytter ikke på nytt og merker containeren.
     """
-    logger.info("2.4.4.2 - Relocation of description lists")
+    args.logger.info("2.4.4.2 - Relocation of description lists")
     if not args.relocate:
-        logger.info("2.4.4.2 - Relocation disabled by flag; skipping.")
+        args.logger.info("2.4.4.2 - Relocation disabled by flag; skipping.")
     else:
         lang = _doc_lang(soup)
 
@@ -11172,7 +11174,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             candidates.append(dl)
 
         if not candidates:
-            logger.info("2.4.4.2 - No movable <dl> found.")
+            args.logger.info("2.4.4.2 - No movable <dl> found.")
 
         moved = 0
         groups_created = 0
@@ -11181,14 +11183,14 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         # Flytt per seksjon
         for dl in list(candidates):
             section = _nearest_section(dl, soup) or soup
-            container, main_level = _ensure_glossary_container(section, lang)
+            container, main_level = _ensure_glossary_container(soup, section, lang)
             if container.get("data-newly-created") != "false" and container.get("data-newly-created") is None:
                 containers_created += 1
                 container["data-newly-created"] = "false"
 
             # Finn side
             page = _find_prev_page_number(dl) or "?"
-            page_dl = _ensure_page_group(container, page, main_level, lang)
+            page_dl = _ensure_page_group(soup, container, page, main_level, lang)
             if page_dl.get("data-newly-created") != "false" and page_dl.get("data-newly-created") is None:
                 groups_created += 1
                 page_dl["data-newly-created"] = "false"
@@ -11212,7 +11214,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 else:
                     break
 
-        logger.info("2.4.4.2 - Done. dl moved=%d, containers=%d, page groups=%d",
+        args.logger.info("2.4.4.2 - Done. dl moved=%d, containers=%d, page groups=%d",
                     moved, containers_created, groups_created)
 
     # 2.5 Tasks
@@ -11223,7 +11225,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Overskrifter "Oppgave 1", "Task 2a" → pakkes i individuell <section class="task">.
     - Gruppehoder "Oppgaver/Oppgåver/Tasks" → sørg for at container-seksjonen har class="task".
     """
-    logger.info("2.5 - Tasks")
+    args.logger.info("2.5 - Tasks")
 
     # Heuristikker / tokens
     TASK_TOKENS   = {"assessment", "exercise", "exercises", "practice", "task", "tasks"}  # epub:type
@@ -11345,7 +11347,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 wrapper.append(el.extract())
                 changed += 1
 
-    logger.info("2.5 - Tasks: updated %d section(s)", changed)
+    args.logger.info("2.5 - Tasks: updated %d section(s)", changed)
 
     # 2.5.1 Specialized task mark-up
 
@@ -11356,7 +11358,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Ikke rør individuelle oppgaver som allerede har egen tittel.
     - Ikke rør fasit/svar (class="key" eller epub:type~answer).
     """
-    logger.info("2.5.1.1 - Main task headings")
+    args.logger.info("2.5.1.1 - Main task headings")
 
     lang = _doc_lang(soup)
     title = _task_title_for_lang(lang)
@@ -11402,7 +11404,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         sec.insert(0, h)
         added += 1
 
-    logger.info(
+    args.logger.info(
         "2.5.1.1 - Done. Containers processed=%d, added=%d, already_had=%d, "
         "skipped_singleton=%d, skipped_answer=%d",
         processed, added, already_had, skipped_singleton, skipped_answer
@@ -11416,7 +11418,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Nummer: hent fra <ol> (start/value) der det finnes, ellers None for <ul>.
     - Idempotent; konverterer eksisterende "Oppgave 1" i <p> til ekte <hN>.
     """
-    logger.info("2.5.1.2 - Individual task headings")
+    args.logger.info("2.5.1.2 - Individual task headings")
 
     lang  = _doc_lang(soup)
     label = _task_label_for_lang(lang)
@@ -11458,12 +11460,12 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             # finn nummer for <ol>, None for <ul>
             number = _compute_decimal_number_for_li(li)
 
-            if _ensure_heading_in_li(li, level, label, number, logger):
+            if _ensure_heading_in_li(li, level, label, number, args.logger):
                 changed_items += 1
 
         processed_containers += 1
 
-    logger.info(
+    args.logger.info(
         "2.5.1.2 - Done. Containers processed=%d, task items updated=%d",
         processed_containers, changed_items
     )
@@ -11476,7 +11478,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Nummer hentes fra ytre <ol> (parent-opppgaven). Bokstav hentes fra indre <ol type='a'|'A'> eller heuristisk.
     - Idempotent; konverterer evt. tekstlig heading i første <p>.
     """
-    logger.info("2.5.1.3 - Subordinate task headings")
+    args.logger.info("2.5.1.3 - Subordinate task headings")
     lang  = _doc_lang(soup)
     label = _task_label_for_lang(lang)
 
@@ -11564,7 +11566,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
         processed_containers += 1
 
-    logger.info(
+    args.logger.info(
         "2.5.1.3 - Done. Containers processed=%d, subordinate tasks updated=%d",
         processed_containers, updated_subtasks
     )
@@ -11577,7 +11579,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - aria-labelledby settes fra oppgave-headingens id.
     - Idempotent; slår sammen/retter eksisterende section-barn og klasser.
     """
-    logger.info("2.5.1.4 - Use of <section> elements in tasks")
+    args.logger.info("2.5.1.4 - Use of <section> elements in tasks")
 
     changed = 0
     fixed_classes = 0
@@ -11654,7 +11656,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
             fixed_classes += 1
 
-    logger.info("2.5.1.4 - Done. sections_created=%d, sections_merged=%d, classes_set=%d",
+    args.logger.info("2.5.1.4 - Done. sections_created=%d, sections_merged=%d, classes_set=%d",
                 changed, merged_existing, fixed_classes)
         
     # 2.5.1.5 Symbols for task types
@@ -11664,9 +11666,9 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Bevar img-referansen i en HTML-kommentar rett etter.
     - Idempotent; endrer kun når label kan bestemmes sikkert.
     """
-    logger.info("2.5.1.5 - Symbols for task types")
+    args.logger.info("2.5.1.5 - Symbols for task types")
 
-    symbol_map = _load_task_symbol_map(folders, logger)
+    symbol_map = _load_task_symbol_map(folders, args.logger)
     scanned = replaced = skipped_ctx = skipped_unresolved = 0
 
     for img in soup.find_all("img"):
@@ -11681,7 +11683,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         if _already_replaced(img):
             continue  # idempotens
 
-        label = _resolve_task_label(img, symbol_map, use_llm, logger)
+        label = _resolve_task_label(img, symbol_map, use_llm, args.logger)
         if not label:
             skipped_unresolved += 1
             continue
@@ -11708,7 +11710,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         img.decompose()
         replaced += 1
 
-    logger.info(
+    args.logger.info(
         "2.5.1.5 - Done. img scanned=%d, replaced=%d, unresolved=%d",
         scanned, replaced, skipped_unresolved
     )
@@ -11722,7 +11724,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Normaliser kuleløse ul → class='list-unstyled'.
     - Idempotent.
     """
-    logger.info("2.5.1.6 - Match problems")
+    args.logger.info("2.5.1.6 - Match problems")
 
     lang = _doc_lang(soup)
     processed = converted = titled = normalized = 0
@@ -11738,7 +11740,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
         # 1) Hvis det finnes <table> → prøv å konvertere
         for tbl in list(cont.find_all("table", recursive=False)) + list(cont.find_all("table")):
-            res = _convert_table_to_two_lists(tbl, soup, lang, logger)
+            res = _convert_table_to_two_lists(tbl, soup, lang, args.logger)
             if res:
                 converted += 1
 
@@ -11756,7 +11758,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 if _normalize_ul_plain(lst):
                     normalized += 1
 
-    logger.info(
+    args.logger.info(
         "2.5.1.6 - Done. containers=%d, tables→lists=%d, titles_added=%d, ul_plain_normalized=%d",
         processed, converted, titled, normalized
     )
@@ -11769,7 +11771,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Ikke la '....' stå alene i en <p>.
     - Idempotent.
     """
-    logger.info("2.5.1.7 - Fill-in-the-blank tasks")
+    args.logger.info("2.5.1.7 - Fill-in-the-blank tasks")
 
     normalized_nodes = 0
     p_fixed = 0
@@ -11809,7 +11811,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             _replace_p_four_dots_with_inline(p)
             p_fixed += 1
 
-    logger.info("2.5.1.7 - Done. text_nodes_normalized=%d, standalone_p_four_dots_fixed=%d",
+    args.logger.info("2.5.1.7 - Done. text_nodes_normalized=%d, standalone_p_four_dots_fixed=%d",
                 normalized_nodes, p_fixed)
 
     # 2.5.1.8 Fill in the correct form – words given
@@ -11820,7 +11822,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Har spørsmålet flere blank-setninger og flere ord → tildel ett ord per setning (sekvensielt).
     - Idempotent; fjerner originalt answer-innhold.
     """
-    logger.info("2.5.1.8 - Fill in the correct form – words given")
+    args.logger.info("2.5.1.8 - Fill in the correct form – words given")
 
     processed = 0
     updated   = 0
@@ -11893,7 +11895,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         for ans in answers:
             _neutralize_answer(ans)
 
-    logger.info(
+    args.logger.info(
         "2.5.1.8 - Done. containers=%d, updated=%d, partial_mismatches=%d, skipped=%d",
         processed, updated, partial, skipped
     )
@@ -11907,7 +11909,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Fjern <hr>/<input>/<textarea>/border-bottom 'linje'-elementer.
     - Fjern/strip <p>/<li> som kun (eller slutt) inneholder linjer.
     """
-    logger.info("2.5.1.9 - Tasks which include lines for answers")
+    args.logger.info("2.5.1.9 - Tasks which include lines for answers")
 
     converted_tables = 0
     stripped_blocks  = 0
@@ -11920,7 +11922,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         if not _in_task_context(cont) or _in_fill_blank_context(cont):
             continue
         for tbl in list(cont.find_all("table")):
-            if _convert_2col_table_to_question_list(tbl, soup, logger):
+            if _convert_2col_table_to_question_list(tbl, soup, args.logger):
                 converted_tables += 1
 
     # 2) Fjern 'linje'-elementer og strip trailing linjer i blokker
@@ -11944,7 +11946,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 node.decompose()
                 removed_lines += 1
 
-    logger.info(
+    args.logger.info(
         "2.5.1.9 - Done. tables_converted=%d, blocks_stripped=%d, line_elements_removed=%d",
         converted_tables, stripped_blocks, removed_lines
     )
@@ -11957,7 +11959,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Titler: (en) Down/Across, (andre) Vannrett/Loddrett.
     - Idempotent; konverterer <ol>→<ul>, legger til titler hvis mangler, normaliserer kuleløs <ul>.
     """
-    logger.info("2.5.1.10 - Crossword puzzles")
+    args.logger.info("2.5.1.10 - Crossword puzzles")
 
     lang = _doc_lang(soup)
     processed = 0
@@ -11982,7 +11984,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         # 1) Sørg for at kryssordet er bilde
         if not _has_crossword_image(cont):
             # Vi konverterer ikke tabell-rutenett → bilde automatisk (risiko for datatap).
-            logger.warning("2.5.1.10 - Crossword container has no <img>; leaving as-is to avoid data loss.")
+            args.logger.warning("2.5.1.10 - Crossword container has no <img>; leaving as-is to avoid data loss.")
             warned_no_img += 1
 
         # 2) Finn inntil to lister for ledetråder (across/down)
@@ -12042,7 +12044,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 if _ensure_list_title_before(lst, title_map[lst]):
                     ensured_titles += 1
 
-    logger.info(
+    args.logger.info(
         "2.5.1.10 - Done. containers=%d, titles_set=%d, uls_normalized=%d, ols_converted=%d, no_img_warnings=%d",
         processed, ensured_titles, normalized_uls, converted_ols, warned_no_img
     )
@@ -12055,7 +12057,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Bevar ev. caption som <figcaption>.
     - Idempotent.
     """
-    logger.info("2.5.1.11 - Word search (tables with one letter per cell)")
+    args.logger.info("2.5.1.11 - Word search (tables with one letter per cell)")
 
     converted = 0
     skipped = 0
@@ -12093,7 +12095,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         tbl.decompose()
         converted += 1
 
-    logger.info("2.5.1.11 - Done. converted=%d, skipped=%d", converted, skipped)
+    args.logger.info("2.5.1.11 - Done. converted=%d, skipped=%d", converted, skipped)
 
     # 2.5.1.12 Tasks with figures
     """
@@ -12101,7 +12103,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Figurer som hører til oppgaver skal stå der de står (ikke flyttes).
     - Merk slike figurer og fjern evt. tidligere 'data-relocated-figure'.
     """
-    logger.info("2.5.1.12 - Tasks with figures")
+    args.logger.info("2.5.1.12 - Tasks with figures")
     protected = cleaned = 0
     for fig in soup.find_all("figure"):
         if _in_task_or_key_ancestor(fig):
@@ -12111,7 +12113,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             if fig.has_attr("data-relocated-figure"):
                 del fig["data-relocated-figure"]
                 cleaned += 1
-    logger.info("2.5.1.12 - Done. Protected=%d, cleaned_relocated_flag=%d", protected, cleaned)
+    args.logger.info("2.5.1.12 - Done. Protected=%d, cleaned_relocated_flag=%d", protected, cleaned)
 
     # 2.5.1.13 Tasks designed as boardgames
     # TODO: check formatting in source
@@ -12121,7 +12123,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Rekkefølge: tall 1..N > absolutt posisjon (top/left) > tabell rad/kolonne.
     - Behold original figur/bilde. Idempotent – bruker class="boardgame-list".
     """
-    logger.info("2.5.1.13 - Tasks designed as boardgames")
+    args.logger.info("2.5.1.13 - Tasks designed as boardgames")
 
     converted = 0
     updated   = 0
@@ -12134,7 +12136,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             tasks.append(el)
 
     if not tasks:
-        logger.info("2.5.1.13 - No task containers found.")
+        args.logger.info("2.5.1.13 - No task containers found.")
     else:
         for task in tasks:
             # Kandidater: figure/div/section som *ser* ut som brettspill
@@ -12227,7 +12229,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                     cand.insert_after(new_list)
                     converted += 1
 
-        logger.info("2.5.1.13 - Done. converted=%d, updated=%d, skipped=%d", converted, updated, skipped)
+        args.logger.info("2.5.1.13 - Done. converted=%d, updated=%d, skipped=%d", converted, updated, skipped)
 
     # 2.5.1.14 Unformatted lists without bullets within tasks <ul class=”list-unstyled”>
     """
@@ -12236,11 +12238,11 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Konverter sekvenser av <p> (≥3, inline-only) til <ul class="list-unstyled"> med <li>-elementer.
     - Idempotent: bruker 'generated-unstyled' for å unngå re-konvertering.
     """
-    logger.info('2.5.1.14 - Unformatted lists without bullets within tasks')
+    args.logger.info('2.5.1.14 - Unformatted lists without bullets within tasks')
 
     tasks = [el for el in soup.find_all(True) if _is_task_container(el)]
     if not tasks:
-        logger.info("2.5.1.14 - No task containers found.")
+        args.logger.info("2.5.1.14 - No task containers found.")
     else:
         normalized_uls = 0
         converted_runs = 0
@@ -12315,7 +12317,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 else:
                     i += 1
 
-        logger.info("2.5.1.14 - Done. normalized_uls=%d, p_runs_converted=%d", normalized_uls, converted_runs)
+        args.logger.info("2.5.1.14 - Done. normalized_uls=%d, p_runs_converted=%d", normalized_uls, converted_runs)
 
     # 2.5.1.15 Lists of tasks with non-standard numbering
     """
@@ -12324,12 +12326,12 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Konverter til <ol class="list-type-none" style="list-style-type: none;">.
     - Behold nummer i li-teksten, fjern 'type'/ 'start'/ 'value'.
     """
-    logger.info('2.5.1.15 - Lists of tasks with non-standard numbering')
+    args.logger.info('2.5.1.15 - Lists of tasks with non-standard numbering')
 
     # Finn alle oppgavecontainere
     tasks = [el for el in soup.find_all(True) if _is_task_container(el)]
     if not tasks:
-        logger.info("2.5.1.15 - No task containers found.")
+        args.logger.info("2.5.1.15 - No task containers found.")
     else:
         converted = 0
         normalized = 0
@@ -12364,7 +12366,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                     else:
                         skipped += 1
 
-        logger.info("2.5.1.15 - Done. converted=%d, normalized=%d, skipped=%d", converted, normalized, skipped)
+        args.logger.info("2.5.1.15 - Done. converted=%d, normalized=%d, skipped=%d", converted, normalized, skipped)
 
     # 2.5.1.16 Tasks where examples of answers are given
     """
@@ -12372,11 +12374,11 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Finn korte 'eksempelsvar' rett under et spørsmål i samme <li>, flytt inn i parentes på slutten av li.
     - Idempotent: markerer li med data-example-collapsed="true" og sjekker for eksisterende parentes.
     """
-    logger.info("2.5.1.16 - Tasks where examples of answers are given")
+    args.logger.info("2.5.1.16 - Tasks where examples of answers are given")
 
     tasks = [el for el in soup.find_all(True) if _is_task_container(el) and not _is_answer_section(el)]
     if not tasks:
-        logger.info("2.5.1.16 - No task containers (excluding answers) found.")
+        args.logger.info("2.5.1.16 - No task containers (excluding answers) found.")
     else:
         collapsed_count = 0
         skipped_count = 0
@@ -12468,7 +12470,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                     li["data-example-collapsed"] = "true"
                     collapsed_count += 1
 
-        logger.info("2.5.1.16 - Done. collapsed=%d, skipped=%d", collapsed_count, skipped_count)
+        args.logger.info("2.5.1.16 - Done. collapsed=%d, skipped=%d", collapsed_count, skipped_count)
 
     # 2.5.1.17 Tasks with ticking boxes
     # TODO: Check formatting
@@ -12478,12 +12480,12 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Fjern tabellen (ikke bruk tabeller).
     - Idempotent via .ticking-boxes-head / .ticking-boxes-list.
     """
-    logger.info("2.5.1.17 - Tasks with ticking boxes")
+    args.logger.info("2.5.1.17 - Tasks with ticking boxes")
 
     lang = _doc_lang(soup)
     tasks = [el for el in soup.find_all(True) if _is_task_container(el)]
     if not tasks:
-        logger.info("2.5.1.17 - No task containers found.")
+        args.logger.info("2.5.1.17 - No task containers found.")
     else:
         converted = updated = headings_set = skipped = 0
 
@@ -12530,7 +12532,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 else:
                     converted += 1
 
-        logger.info(
+        args.logger.info(
             "2.5.1.17 - Done. converted=%d, updated=%d, headings_set=%d, skipped=%d",
             converted, updated, headings_set, skipped
         )
@@ -12544,11 +12546,11 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Lager valgfri heading-<p class="table-as-list-head"> fra TH-rad (også separert med '; ').
     - Idempotent: erstatter tidligere generert liste med class="table-as-list".
     """
-    logger.info("2.5.1.18 - Tasks with tables better represented as lists")
+    args.logger.info("2.5.1.18 - Tasks with tables better represented as lists")
 
     tasks = [el for el in soup.find_all(True) if _is_task_container(el)]
     if not tasks:
-        logger.info("2.5.1.18 - No task containers found.")
+        args.logger.info("2.5.1.18 - No task containers found.")
     else:
         converted = updated = skipped = 0
 
@@ -12603,7 +12605,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                         pass
                     converted += 1
 
-        logger.info(
+        args.logger.info(
             "2.5.1.18 - Done. converted=%d, updated=%d, skipped=%d",
             converted, updated, skipped
         )
@@ -12616,11 +12618,11 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Behold liste udelte; pakk inn i <p>.
     - Idempotent (hopper over li som allerede starter med .extra-text).
     """
-    logger.info("2.5.1.19 - Tasks with text between subtasks")
+    args.logger.info("2.5.1.19 - Tasks with text between subtasks")
 
     tasks = [el for el in soup.find_all(True) if _is_task_container(el)]
     if not tasks:
-        logger.info("2.5.1.19 - No task containers found.")
+        args.logger.info("2.5.1.19 - No task containers found.")
     else:
         moved_blocks = 0
         touched_lists = 0
@@ -12676,7 +12678,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 if list_touched:
                     touched_lists += 1
 
-        logger.info("2.5.1.19 - Done. moved_blocks=%d, touched_lists=%d", moved_blocks, touched_lists)
+        args.logger.info("2.5.1.19 - Done. moved_blocks=%d, touched_lists=%d", moved_blocks, touched_lists)
 
     # 2.5.2 Tasks in mathematics books
     """
@@ -12685,9 +12687,9 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - I fasit/svar: <section class="key"> + heading.
     - Heading dannes av listenumre (støtter type/start/value) + ev. trailing stor bokstav (f.eks. 'U').
     """
-    logger.info("2.5.2 - Tasks in mathematics books")
+    args.logger.info("2.5.2 - Tasks in mathematics books")
     if not getattr(args, "mathematics", False):
-        logger.info("2.5.2 - Not a mathematics book; skipping.")
+        args.logger.info("2.5.2 - Not a mathematics book; skipping.")
     else:
         wrapped_task = wrapped_key = 0
 
@@ -12725,7 +12727,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                     _ensure_heading_in_section(sec, label, soup)
                     wrapped_key += 1
 
-        logger.info("2.5.2 - Done. wrapped_task=%d, wrapped_key=%d", wrapped_task, wrapped_key)
+        args.logger.info("2.5.2 - Done. wrapped_task=%d, wrapped_key=%d", wrapped_task, wrapped_key)
 
     # 2.6 Sidebars, text boxes etc.
     """
@@ -12733,9 +12735,9 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Normaliser nivå/klasse for reelle sidebokser (<aside>), ev. konverter integrerte til <div>.
     - Idempotent; flytter kun ved behov og respekterer prodnote/fig-desc/glossary.
     """
-    logger.info("2.6 - Sidebars, text boxes etc.")
+    args.logger.info("2.6 - Sidebars, text boxes etc.")
 
-    llm = _ensure_llm_client(logger, use_llm) if use_llm else None
+    llm = _ensure_llm_client(args.logger, use_llm) if use_llm else None
 
     converted_to_div = lifted = heading_adjusted = framed = 0
 
@@ -12791,13 +12793,13 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         _normalize_frame_classes(box)
         framed += 1
 
-    logger.info(
+    args.logger.info(
         "2.6 - Done. converted_to_div=%d, lifted=%d, headings_adjusted=%d, framed=%d",
         converted_to_div, lifted, heading_adjusted, framed
     )
 
     # 2.6.1 Boxes in mathematics books
-    logger.info('2.6.1 - Boxes in mathematics books')
+    args.logger.info('2.6.1 - Boxes in mathematics books')
     if args.mathematics:
         for aside in soup.find_all('aside'):
             et = (aside.get('epub:type') or '').lower()
@@ -12815,17 +12817,17 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Idempotent: fjerner originalboks etter flytting; dedupliserer <li> på tekstinnhold.
     - LLM (valgfritt): binær klassifisering i tvilstilfeller.
     """
-    logger.info("2.7 - Comments in the margin")
+    args.logger.info("2.7 - Comments in the margin")
 
     # Respekter --no-relocate hvis du bruker det i prosjektet
     if hasattr(args, "relocate") and not getattr(args, "relocate", True):
-        logger.info("2.7 - Relocation disabled (--no-relocate); skipping.")
+        args.logger.info("2.7 - Relocation disabled (--no-relocate); skipping.")
     else:
         # Valgfri LLM-klient
         llm = None
         if use_llm and "._ensure_llm_client" in str(globals().get("_ensure_llm_client", "")):
             try:
-                llm = _ensure_llm_client(logger, use_llm)
+                llm = _ensure_llm_client(args.logger, use_llm)
             except Exception:
                 llm = None
 
@@ -12863,7 +12865,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
             section = _nearest_section(box, soup) or soup.body
             if section is None:
-                logger.debug("2.7 - No <section>/<body> context for margin comment; skipping one.")
+                args.logger.debug("2.7 - No <section>/<body> context for margin comment; skipping one.")
                 continue
 
             target = anchor if (anchor and isinstance(anchor, Tag)) else section
@@ -12893,7 +12895,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             except Exception:
                 pass
 
-        logger.info("2.7 - Done. candidates=%d, moved=%d", found, moved)
+        args.logger.info("2.7 - Done. candidates=%d, moved=%d", found, moved)
 
     # 2.8 Texts with specific styles
 
@@ -12905,21 +12907,21 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Behandler bare seksjoner med sterke 'play'-cues.
     - Idempotent (rører ikke korrekt eksisterende mark-up).
     """
-    logger.info("2.8.1 - Plays and screenplays")
+    args.logger.info("2.8.1 - Plays and screenplays")
 
     # Aldri i matte/realfag
     if getattr(args, "mathematics", False) or getattr(args, "science", False):
-        logger.info("2.8.1 - Skipping: mathematics/science book.")
+        args.logger.info("2.8.1 - Skipping: mathematics/science book.")
 
     # Kun når skrudd på eksplisitt
     elif not getattr(args, "plays", False):
-        logger.info("2.8.1 - Skipping: --plays not set.")
+        args.logger.info("2.8.1 - Skipping: --plays not set.")
 
     else:
         # Finn sannsynlige drama-seksjoner
         candidates = [sec for sec in soup.find_all("section") if _section_has_play_cues(sec)]
         if not candidates:
-            logger.info("2.8.1 - No convincing play cues found; skipping.")
+            args.logger.info("2.8.1 - No convincing play cues found; skipping.")
         else:
             speaker_lines = directions = sections_marked = 0
 
@@ -12951,7 +12953,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                             p["class"] = sorted(classes)
                             directions += 1
 
-            logger.info("2.8.1 - Done. speaker_lines=%d, directions=%d, sections_marked=%d",
+            args.logger.info("2.8.1 - Done. speaker_lines=%d, directions=%d, sections_marked=%d",
                         speaker_lines, directions, sections_marked)
 
     # 2.9 Page breaks
@@ -12961,12 +12963,12 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Flytt fra inline/p til blokknivå der mulig (splitter <p> rent).
     - Idempotent; bevarer id/label; lager unik id ved kollisjon.
     """
-    logger.info("2.9 - Page breaks")
+    args.logger.info("2.9 - Page breaks")
 
     # Finn alle potensielle pagebreaks: <span>/<div>/<a>/... med epub:type eller role
     candidates = [el for el in soup.find_all(True) if _is_pagebreak(el)]
     if not candidates:
-        logger.info("2.9 - No pagebreaks found.")
+        args.logger.info("2.9 - No pagebreaks found.")
     else:
         # For å kunne sikre unike id-er må vi kjenne eksisterende id'er
         existing_ids = set()
@@ -13008,7 +13010,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 _move_pagebreak_to_block_level(pb)
                 moved_inline += 1
 
-        logger.info(
+        args.logger.info(
             "2.9 - Done. normalized=%d, moved_out_of_p=%d, moved_from_inline=%d, labeled_from_id=%d",
             converted, moved_p, moved_inline, labeled
         )
@@ -13022,11 +13024,11 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
       • Ved ny <section>: plasser mellom seksjonsstart og heading, ikke på slutten av forrige seksjon.
       • Inline-sikkerhet: hvis pb ligger i <p>, flytt den ut (bruker § 2.9-hjelper).
     """
-    logger.info("2.9.1 - Relocation of page breaks")
+    args.logger.info("2.9.1 - Relocation of page breaks")
 
     pagebreaks = [el for el in soup.find_all("div") if "pagebreak" in (el.get("epub:type") or "")]
     if not pagebreaks:
-        logger.info("2.9.1 - No pagebreaks found.")
+        args.logger.info("2.9.1 - No pagebreaks found.")
     else:
         moved_lists = moved_sections = moved_inline = 0
 
@@ -13061,7 +13063,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                     # la den stå – eller flytt etter prev? Vi velger å la den stå for idempotens/stabilitet.
                     pass
 
-        logger.info(
+        args.logger.info(
             "2.9.1 - Done. moved_in_lists=%d, moved_at_section_start=%d, fixed_inline=%d",
             moved_lists, moved_sections, moved_inline
         )
@@ -13074,11 +13076,11 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Resten flyttes til <tbody>.
     - Bevar/sett riktig rekkefølge og 'scope' på <th>.
     """
-    logger.info("2.10 - Tables")
+    args.logger.info("2.10 - Tables")
 
     tables = soup.find_all("table")
     if not tables:
-        logger.info("2.10 - No tables found.")
+        args.logger.info("2.10 - No tables found.")
     else:
         fixed = created_head = created_body = moved_rows = 0
 
@@ -13154,7 +13156,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 created_body += 1
             fixed += 1
 
-        logger.info(
+        args.logger.info(
             "2.10 - Done. tables=%d, created thead=%d, created tbody=%d, moved rows=%d",
             fixed, created_head, created_body, moved_rows
         )
@@ -13168,11 +13170,11 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     - Hvis 'flag cell' (f.eks. én synlig celle + én skjult i første rad) → flytt den synlige cellens innhold til <caption>.
     - Idempotent: flere kjøringer endrer ikke resultatet.
     """
-    logger.info("2.10.1 - Table titles")
+    args.logger.info("2.10.1 - Table titles")
 
     tables = soup.find_all("table")
     if not tables:
-        logger.info("2.10.1 - No tables found.")
+        args.logger.info("2.10.1 - No tables found.")
     else:
         used_title = moved_single_row = moved_flag_cell = moved_to_front = 0
 
@@ -13256,7 +13258,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 _move_caption_first(table)
                 moved_to_front += 1
 
-        logger.info(
+        args.logger.info(
             "2.10.1 - Done. from @title=%d, single-row→caption=%d, flag-cell→caption=%d, moved-to-front=%d",
             used_title, moved_single_row, moved_flag_cell, moved_to_front
         )
@@ -13270,18 +13272,18 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
       konverter til <ul class="list-unstyled"> inne i cellen (ikke endre rader/kolonner).
     - Hvis --llm: bruk modellen for å bekrefte normalisering ved tvilstilfeller.
     """
-    logger.info("2.10.2 - Tables without clear boundaries between rows/columns")
+    args.logger.info("2.10.2 - Tables without clear boundaries between rows/columns")
 
     llm = None
     if getattr(args, "llm", False):
         try:
-            llm = _ensure_llm_client(logger, args.llm)  # din eksisterende stub
+            llm = _ensure_llm_client(args.logger, args.llm)  # din eksisterende stub
         except Exception:
             llm = None
 
     tables = soup.find_all("table")
     if not tables:
-        logger.info("2.10.2 - No tables found.")
+        args.logger.info("2.10.2 - No tables found.")
     else:
         flagged = normalized = 0
 
@@ -13308,14 +13310,14 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                             do_normalize = False
 
                     if do_normalize:
-                        changed = _normalize_cell_to_ul(cell, soup, logger)
+                        changed = _normalize_cell_to_ul(cell, soup, args.logger)
                         if changed:
                             normalized += 1
 
-        logger.info("2.10.2 - Done. Flagged cells=%d, Normalized=%d", flagged, normalized)
+        args.logger.info("2.10.2 - Done. Flagged cells=%d, Normalized=%d", flagged, normalized)
 
     # 2.10.3 Avoid use of <em> or <strong> in <th>
-    logger.info('2.10.3 - Avoid use of <em> or <strong> in <th>')
+    args.logger.info('2.10.3 - Avoid use of <em> or <strong> in <th>')
 
     unwrapped = 0
     for th in soup.find_all("th"):
@@ -13324,10 +13326,10 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             emph.unwrap()
             unwrapped += 1
 
-    logger.info(f'2.10.3 - Unwrapped {unwrapped} <em>/<strong> tag(s) inside <th>.')
+    args.logger.info(f'2.10.3 - Unwrapped {unwrapped} <em>/<strong> tag(s) inside <th>.')
 
     # 2.10.4 Avoid use of <p> within table cells
-    logger.info('2.10.4 - Avoid use of <p> within table cells')
+    args.logger.info('2.10.4 - Avoid use of <p> within table cells')
 
 
     unwrapped_single = merged_multi = skipped = 0
@@ -13387,7 +13389,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         # 3) Default: la stå
         skipped += 1
 
-    logger.info(f"2.10.4 - Done. Unwrapped single <p>: {unwrapped_single}, merged multi-<p>: {merged_multi}, skipped: {skipped}")
+    args.logger.info(f"2.10.4 - Done. Unwrapped single <p>: {unwrapped_single}, merged multi-<p>: {merged_multi}, skipped: {skipped}")
 
     # 2.10.5 Lists within tables
     # Already implemented by SMR 2.4
@@ -13426,7 +13428,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 _ensure_style_none(lst)
                 stats["ol_plain_nonstd"] += 1
 
-    logger.info(
+    args.logger.info(
         "2.10.5 - Done. Unwrapped LI<p>=%d, merged LI<p>=%d, bullets stripped=%d, ul plain set=%d, ol nonstd plain=%d, math cells skipped=%d",
         stats["li_p_unwrapped"], stats["li_p_merged"], stats["bullets_stripped"], stats["ul_plain_set"],
         stats["ol_plain_nonstd"], stats["skipped_math_cell"]
@@ -13486,7 +13488,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         table.decompose()
         converted += 1
 
-    logger.info(
+    args.logger.info(
         "2.10.6 - Done. Converted tables: %d, skipped (not all cells empty): %d, skipped (no headings found): %d",
         converted, skipped_not_empty, skipped_no_headings
     )
@@ -13495,7 +13497,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     # TODO: The conversion of table to list should be done interactively
 
     try:
-        llm = _ensure_llm_client(logger, getattr(args, "llm", False)) if getattr(args, "llm", False) else None
+        llm = _ensure_llm_client(args.logger, getattr(args, "llm", False)) if getattr(args, "llm", False) else None
     except NameError:
         llm = None  # _ensure_llm_client finnes ikke i dette miljøet
 
@@ -13512,7 +13514,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 
         is_layout, reason = _estimate_layout_table(table)
         if not is_layout and llm:
-            llm_decision = _llm_agrees_layout(table, llm, logger)
+            llm_decision = _llm_agrees_layout(table, llm, args.logger)
             if llm_decision is False:
                 skipped_llm += 1
                 continue
@@ -13544,12 +13546,12 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         table.decompose()
         converted += 1
 
-    logger.info(
+    args.logger.info(
         "2.10.7 - Done. Converted=%d, skipped_complex=%d, skipped_heuristics=%d, skipped_llm=%d",
         converted, skipped_complex, skipped_heur, skipped_llm
     )
 
-    # --- Lett etter-validering (logger kun) -------------------------------------
+    # --- Lett etter-validering (args.logger kun) -------------------------------------
     bad_semicolons = 0
     bad_header_pairs = 0
 
@@ -13563,7 +13565,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 bad_header_pairs += 1
 
     if bad_semicolons or bad_header_pairs:
-        logger.warning(
+        args.logger.warning(
             "2.10.7 - Post-check: double-separators=%d, header-without-value=%d",
             bad_semicolons, bad_header_pairs
         )
@@ -13573,7 +13575,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     # This requirement should be covered by SMR 2.3.7.1
 
     # 2.11 Quotations, blockquotes, sources
-    llm = _ensure_llm(logger, args)
+    llm = _ensure_llm(args.logger, args)
     moved_bq = moved_fig = moved_tbl = 0
     skipped = 0
 
@@ -13634,7 +13636,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             _append_source_to_caption(tbl, soup, sib)
             moved_tbl += 1
 
-    logger.info(
+    args.logger.info(
         "2.11 - Done. Moved: blockquotes=%d, figures=%d, tables=%d",
         moved_bq, moved_fig, moved_tbl
     )
@@ -13642,7 +13644,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     # 2.12 Footnotes and endnotes
 
     # 2.12.1 Footnotes
-    llm = _ensure_llm(logger, args)
+    llm = _ensure_llm(args.logger, args)
     moved_single = moved_lists = 0
     skipped = 0
 
@@ -13751,7 +13753,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         fn["data-relocated-footnote"] = "true"
         moved_single += 1
 
-    logger.info("2.12.1 - Done. Moved lists=%d, moved singles=%d, skipped=%d",
+    args.logger.info("2.12.1 - Done. Moved lists=%d, moved singles=%d, skipped=%d",
                 moved_lists, moved_single, skipped)
 
     # 2.12.2 Endnotes and chapter notes
@@ -13764,7 +13766,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             singles.append(el)
 
     # Hvis ingen eksplisitte containere, se etter sannsynlige (heading 'Noter', 'Endnotes' etc.)
-    llm = _end_ensure_llm(logger, args)
+    llm = _end_ensure_llm(args.logger, args)
     if not containers:
         # Heuristisk: <section>/<div> med heading-tekst "Noter"/"Endnotes"/"Kapittelnoter"
         for cand in soup.find_all(["section","div"]):
@@ -13868,7 +13870,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
             except Exception:
                 pass
 
-    logger.info("2.12.2 - Done. Merged containers=%d, moved singles=%d", merged, moved_singles)
+    args.logger.info("2.12.2 - Done. Merged containers=%d, moved singles=%d", merged, moved_singles)
 
     # 2.13 Grammar
 
@@ -13894,7 +13896,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                         table["data-llm-pending"] = "sentence-analysis"
                         flagged_llm += 1
         except Exception as e:
-            logger.debug(f"2.13.1 - Table conversion failed: {e}")
+            args.logger.debug(f"2.13.1 - Table conversion failed: {e}")
 
     # 2) Span-baserte avsnitt
     for par in list(soup.find_all("p")):
@@ -13911,9 +13913,9 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                         par["data-llm-pending"] = "sentence-analysis"
                         flagged_llm += 1
         except Exception as e:
-            logger.debug(f"2.13.1 - Span conversion failed: {e}")
+            args.logger.debug(f"2.13.1 - Span conversion failed: {e}")
 
-    logger.info(
+    args.logger.info(
         "2.13.1 - Done. Converted tables=%d, converted spans=%d, flagged_for_llm=%d",
         converted_tables, converted_spans, flagged_llm
     )
@@ -13925,11 +13927,11 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
     flagged   = 0
 
     if getattr(args, "mathematics", False):
-        logger.info("2.13.2 - Mathematics book detected; skipping conjugation conversion to avoid false positives.")
+        args.logger.info("2.13.2 - Mathematics book detected; skipping conjugation conversion to avoid false positives.")
     else:
         for table in list(soup.find_all("table")):
             try:
-                if _convert_conjugation_table(table, soup, logger):
+                if _convert_conjugation_table(table, soup, args.logger):
                     converted += 1
                 else:
                     # valgfritt: flagg for LLM dersom tabellen *kan* være grammatikk (svak indikasjon)
@@ -13949,9 +13951,9 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                             table["data-llm-pending"] = "conjugation-candidate"
                             flagged += 1
             except Exception as e:
-                logger.debug(f"2.13.2 - Failed on one table: {e}")
+                args.logger.debug(f"2.13.2 - Failed on one table: {e}")
 
-    logger.info("2.13.2 - Done. Converted=%d, flagged_for_llm=%d", converted, flagged)
+    args.logger.info("2.13.2 - Done. Converted=%d, flagged_for_llm=%d", converted, flagged)
 
     # 2.14 Poems
     # TODO: Check original formats. This needs to be interactive
@@ -13962,19 +13964,19 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
         for tag in soup.find_all(["section","div","article"]):
             if _is_poem_explicit(tag):
                 try:
-                    if _normalize_poem_container(tag, soup, logger=logger):
+                    if _normalize_poem_container(tag, soup, logger=args.logger):
                         normalized += 1
                 except Exception as e:
-                    logger.debug(f"2.14 - Failed (math mode) on one poem container: {e}")
+                    args.logger.debug(f"2.14 - Failed (math mode) on one poem container: {e}")
     else:
         # Ikke-matte: normaliser eksplisitte, flagg kandidater
         for tag in soup.find_all(["section","div","article","blockquote"]):
             if _is_poem_explicit(tag):
                 try:
-                    if _normalize_poem_container(tag, soup, logger=logger):
+                    if _normalize_poem_container(tag, soup, logger=args.logger):
                         normalized += 1
                 except Exception as e:
-                    logger.debug(f"2.14 - Failed on one poem container: {e}")
+                    args.logger.debug(f"2.14 - Failed on one poem container: {e}")
 
         # Flagge mulige dikt (kun hvis LLM er på)
         if getattr(args, "llm", False):
@@ -13985,14 +13987,14 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                     p["data-llm-pending"] = "poem-candidate"
                     flagged += 1
 
-    logger.info("2.14 - Done. Normalized=%d, flagged_for_llm=%d", normalized, flagged)
+    args.logger.info("2.14 - Done. Normalized=%d, flagged_for_llm=%d", normalized, flagged)
 
 
     # 2.15 Inline language markup
     if not getattr(args, "detect_languages", False):
-        logger.info("2.15 - Inline language markup (disabled by --detect-languages)")
+        args.logger.info("2.15 - Inline language markup (disabled by --detect-languages)")
     else:
-        logger.info("2.15 - Inline language markup")
+        args.logger.info("2.15 - Inline language markup")
         base_lang = _doc_lang(soup)
         auto_wrapped = 0
         llm_flagged  = 0
@@ -14046,11 +14048,11 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
                 auto_wrapped += sum(1 for a in actions if a["kind"] == "wrap")
                 llm_flagged  += sum(1 for a in actions if a["kind"] == "flag")
 
-        logger.info("2.15 - Done. Auto-wrapped (non-Latin)=%d, flagged_latin_candidates=%d",
+        args.logger.info("2.15 - Done. Auto-wrapped (non-Latin)=%d, flagged_latin_candidates=%d",
                     auto_wrapped, llm_flagged)
 
     # 2.16 Mathematics
-    logger.info('2.16 - Mathematics')
+    args.logger.info('2.16 - Mathematics')
     if args.mathematics or args.science:
         pass # TODO: This section is deprecated, given that MathML is the new standard
 
@@ -14059,6 +14061,7 @@ def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
 def run_xslt(input_xml, stylesheet, output_xml, logger):
     
     print("Running XSLT transformation...")
+    logger.info("Running XSLT transformation...")
     saxon_command = [
         'java', '-jar', path.join(Path(__file__).parent, 'saxon', 'saxon-he-10.5.jar'),
         '-s:' + input_xml,
@@ -14069,24 +14072,86 @@ def run_xslt(input_xml, stylesheet, output_xml, logger):
     try:
         subprocess.run(saxon_command, check=True)
         print("XSLT transformation successful.")
+        logger.info("XSLT transformation successful.")
     except subprocess.CalledProcessError as e:
         print("XSLT transformation failed:", e)
+        logger.error("XSLT transformation failed: %s", e)
 
-# def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
-def convert(args, logger):
+def find_production_number(soup, args, logger):
+    # Finn produksjonsnummer
+    logger.info("Finding production number...")
+    production_number = None
+    if (meta := soup.find("meta", attrs={"name": "dc:identifier"})) and meta.get("content"):
+        return meta["content"].strip()
+    else:
+        return path.splitext(path.basename(args.input))[0]
+
+
+# def apply_requirements(soup, args.logger, folders, args, comic_text_rpc=None):
+def convert(args):
     # Les fil og parse som XML/XHTML
+    args.logger.info(f"Applying Statped Mark-up Requirements to file:::: {args.input}")
+    
+    if getattr(args, "data", None):
+        content = args.data
+    else:
+        content = Path(args.input).read_bytes()
     try:
-        soup = BeautifulSoup(args.data, "xml")
+        soup = BeautifulSoup(content, "xml")
 
     except Exception:
         # fallback hvis 'xml'-parser ikke er tilgjengelig
-        soup = BeautifulSoup(args.data, "lxml-xml")
+        soup = BeautifulSoup(content, "lxml-xml")
+
+    if not 'production_number' in vars(args):
+        args.production_number = find_production_number(soup, args, args.logger)
+
+
+
+    tmp = path.join(getcwd(), 'tmp')
+    folders = {
+            'cwd'       : getcwd(),
+            'input'     : path.join(getcwd(), args.input),
+            'output'    : path.join(OUTPUT_DIR, args.production_number),
+            'logs'      : path.join(getcwd(), 'logs'),
+            'static'    : STATIC_DIR,
+            'tmp'       : path.join(getcwd(), tmp),
+            'source'    : path.join(tmp, 'source'),
+            'target'    : path.join(tmp, 'target'),
+            'root'      : path.join(tmp, 'target'),
+            'epub'      : path.join(tmp, 'target'), #'EPUB'),
+            }
+
+    output_folder = path.join(folders['output'], args.production_number)
+    rmtree(folders['output'], ignore_errors=True)
+    rmtree(folders['logs'], ignore_errors=True)
+    rmtree(folders['tmp'], ignore_errors=True)
+    mkdir(folders['output'])
+    mkdir(folders['logs'])
+    mkdir(folders['tmp'])
+    mkdir(folders['source'])
+    
+
+    makedirs(args.job_dir, exist_ok=True)
+
+    '''
+    #epub.extractall(folders['source'])
+    copytree(args.input, folders['source'], dirs_exist_ok=True)
+    rmtree(path.join(folders['source'], '__MACOSX'), ignore_errors=True)
+    copytree(path.join(folders['source']), folders['target'])
+    '''
 
     # TODO: move args.folders to args
-    soup = apply_requirements(soup, logger, args.folders, args)
-    return soup.prettify(formatter="minimal").encode("utf-8")
+    soup = apply_requirements(soup, args.logger, folders, args)
+    #save to file
+    with open(args.job_dir / f"{args.production_number}.xhtml", "wb") as f:
+        f.write(soup.prettify(formatter="minimal").encode("utf-8"))
+    status = "success"
+    message = "Fil er konvertert fra xhtml til xhtml med Statped Mark-up Requirements."
+    return {"status": status, "message": message}
+    #return soup.prettify(formatter="minimal").encode("utf-8")
 
-def convert02(args, logger):
+def convert02(args):
     #production_number = Path(file).stem
     #if not production_number:
     production_number   = path.splitext(path.basename(args.input))[0]
@@ -14302,9 +14367,15 @@ def main():
     # Set up logger
     logger = getLogger(__name__)
     
+    with open(args.input, 'rb') as f:
+        args.data = f.read()
 
+    args.job_id = '0000'
+    args.job_dir = ARTIFACTS_ROOT / args.job_id
+
+    args.logger = logger
     # Convert epub
-    convert(args, logger)
+    convert(args)
 
 
 if __name__ == '__main__':
