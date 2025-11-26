@@ -314,6 +314,7 @@ async def _handle_work_message(m: aio_pika.IncomingMessage):
             llm=bool(llm),
             aggressive=bool(False),
             relocate=bool(relocate),
+            logger=logger,
         )
 
         #print(f"Args: {args}")
@@ -321,7 +322,7 @@ async def _handle_work_message(m: aio_pika.IncomingMessage):
 
         # 2) Run xhtml_to_statpub
         try:
-            status = convert(args, logger)
+            status = convert(args)
         except Exception as e:
             # crash → publish fail
             artifacts = {"error": f"xhtml_to_statpub crashed: {e}"}
