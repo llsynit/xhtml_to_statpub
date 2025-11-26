@@ -14132,8 +14132,6 @@ def convert(args):
     mkdir(folders['source'])
     
 
-    makedirs(args.job_dir, exist_ok=True)
-
     '''
     #epub.extractall(folders['source'])
     copytree(args.input, folders['source'], dirs_exist_ok=True)
@@ -14144,9 +14142,11 @@ def convert(args):
     # TODO: move args.folders to args
     soup = apply_requirements(soup, args.logger, folders, args)
     #save to file
+    rmtree(args.job_dir, ignore_errors=True)
+    makedirs(args.job_dir, exist_ok=True)
     with open(args.job_dir / f"{args.production_number}.xhtml", "wb") as f:
         f.write(soup.prettify(formatter="minimal").encode("utf-8"))
-    status = "success"
+    status = "success" # ?
     message = "Fil er konvertert fra xhtml til xhtml med Statped Mark-up Requirements."
     return {"status": status, "message": message}
     #return soup.prettify(formatter="minimal").encode("utf-8")
