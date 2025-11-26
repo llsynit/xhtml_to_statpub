@@ -297,7 +297,7 @@ async def _handle_work_message(m: aio_pika.IncomingMessage):
         mathematics = False
         science = False
         args = SimpleNamespace(
-            file=str(tmp_xhtml),
+            input=str(tmp_xhtml),
             folders=folders,
             production_number=production_number,
             mathematics=bool(mathematics),
