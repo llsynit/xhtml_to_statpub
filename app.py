@@ -214,7 +214,7 @@ async def run(
 
       # Bygg args-objektet (dot-notasjon) slik apply_requirements forventer
     args = SimpleNamespace(
-        file=xhtml_path,
+        input=xhtml_path,
         folders=folders,
         production_number=production_number,
         data=data,
