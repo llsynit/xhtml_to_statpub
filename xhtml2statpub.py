@@ -1461,22 +1461,6 @@ def _has_alnum_text(node) -> bool:
 
 # --- end ust used several times ------------------------------------------------------
 
-def _insert_br_before_if_needed(soup, anchor):
-    prev = anchor.previous_sibling
-    while prev is not None and isinstance(prev, NavigableString) and not prev.strip():
-        prev = prev.previous_sibling
-
-    if prev is None:
-        return False
-    # allerede br?
-    if getattr(prev, "name", None) == "br":
-        return False
-    # sett inn br hvis forrige er tekst med innhold eller <math>
-    if getattr(prev, "name", "").lower() == "math" or _has_alnum_text(prev):
-        anchor.insert_before(soup.new_tag("br"))
-        return True
-    return False
-
 def _insert_br_after_if_needed(soup, anchor):
     nxt = anchor.next_sibling
     while nxt is not None and isinstance(nxt, NavigableString) and not nxt.strip():
@@ -9013,8 +8997,19 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
             if _in_protected(m):   # (math inni math/skript er uansett uaktuelt, men safe guard)
                 continue
 
+            insert_br_before_if_needed = False
+            prev = m.previous_sibling
+            # TODO: make more robust
+            while prev is not None and isinstance(prev, NavigableString) and not prev.strip():
+                prev = prev.previous_sibling
+            if (prev and
+                not getattr(prev, "name", None) == "br" and
+                getattr(prev, "name", "").lower() == "math" or _has_alnum_text(prev)
+                ):
+                insert_br_before_if_needed = True
+    
             # Sett inn <br> før/etter ved behov
-            if _insert_br_before_if_needed(soup, m):
+            if insert_br_before_if_needed:
                 inserted += 1
             if _insert_br_after_if_needed(soup, m):
                 inserted += 1
