@@ -1454,12 +1454,6 @@ def _in_protected(node) -> bool:
 
 # --- end ust used several times ------------------------------------------------------
 
-def _prev_non_ws(n):
-    s = n.previous_sibling
-    while s is not None and isinstance(s, NavigableString) and not s.strip():
-        s = s.previous_sibling
-    return s
-
 def _next_non_ws(n):
     s = n.next_sibling
     while s is not None and isinstance(s, NavigableString) and not s.strip():
@@ -1477,7 +1471,10 @@ def _is_math(node) -> bool:
     return getattr(node, "name", "").lower() == "math"
 
 def _insert_br_before_if_needed(soup, anchor):
-    prev = _prev_non_ws(anchor)
+    prev = anchor.previous_sibling
+    while prev is not None and isinstance(prev, NavigableString) and not prev.strip():
+        prev = prev.previous_sibling
+
     if prev is None:
         return False
     # allerede br?
