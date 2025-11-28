@@ -12,25 +12,26 @@ https://idpf.org/epub/profiles/edu/structure/
 # =======
 
 import logging
-from logging        import getLogger, DEBUG, INFO, WARNING, StreamHandler, Formatter
-from argparse       import ArgumentParser
-from bs4            import BeautifulSoup, NavigableString, Comment, Tag
-from lxml           import etree
-from io             import StringIO, BytesIO
-from glob           import glob
-from zipfile        import ZipFile, ZIP_DEFLATED
-from shutil         import rmtree, copytree, copyfile, make_archive, move
-from os             import path, mkdir, getcwd, walk, remove, rename, makedirs
-from pathlib        import Path
-from nltk.tokenize  import word_tokenize
-from ipapy          import is_valid_ipa
-from epubcheck      import EpubCheck
-from unicodedata    import normalize
-from pika           import BlockingConnection, ConnectionParameters, PlainCredentials
-from time           import sleep, time
-from collections    import Counter
-from urllib.parse   import urlparse, unquote
-from datetime       import datetime
+from logging            import getLogger, DEBUG, INFO, WARNING, StreamHandler, Formatter
+from argparse           import ArgumentParser
+from bs4                import BeautifulSoup, NavigableString, Comment, Tag
+from lxml               import etree
+from io                 import StringIO, BytesIO
+from glob               import glob
+from zipfile            import ZipFile, ZIP_DEFLATED
+from shutil             import rmtree, copytree, copyfile, make_archive, move
+from os                 import path, mkdir, getcwd, walk, remove, rename, makedirs
+from pathlib            import Path
+from nltk.tokenize      import word_tokenize
+from ipapy              import is_valid_ipa
+from epubcheck          import EpubCheck
+from unicodedata        import normalize
+from pika               import BlockingConnection, ConnectionParameters, PlainCredentials
+from time               import sleep, time
+from collections        import Counter
+from urllib.parse       import urlparse, unquote
+from datetime           import datetime
+from collections.abc    import Iterable
 from typing import (
     Any,
     Optional,
@@ -43,7 +44,7 @@ from typing import (
     Set,
 )
 
-import sys, unicodedata, string, re, nltk, subprocess #spacy, cv2, json, uuid
+import sys, unicodedata, string, re, nltk, subprocess, pytesseract #spacy, cv2, json, uuid
 
 import xml.etree.ElementTree    as ET
 import numpy                    as np
@@ -65,10 +66,7 @@ try:
     from PIL import Image
 except ImportError:
     import Image
-import pytesseract
-# nltk.download('punkt_tab') -> moved to Dockerfile
 
-#from config import ARTIFACTS_ROOT, ARTIFACTS_RETENTION_HOURS
 from config import (MODULE_NAME_XHTML_TO_STATPUB, PORT_XHTML_TO_STATPUB, RABBITMQ_URL,
                     WORK_EXCHANGE, RESULTS_EXCHANGE,
                     WORK_ROUTING_KEY_XHTML_TO_STATPUB, WORK_QUEUE_NAME_XHTML_TO_STATPUB,
@@ -1428,34 +1426,33 @@ def _snippet(el, n=140):
     t = el.get_text(" ", strip=True)
     return (t[:n] + "…") if len(t) > n else t
 
+def _in_protected(node) -> bool:
+    """
+    Returner True hvis noden (eller en av dens forfedre) har et tag-navn
+    som finnes i en av de globale settene:
+    _PROTECTED_ANCESTORS, _PROTECTED eller PROTECTED (case-insensitivt).
+    """
+
+    # Slå sammen alle beskyttede navnesett som faktisk finnes
+    protected_names: set[str] = set()
+    for name in ("_PROTECTED_ANCESTORS", "_PROTECTED", "PROTECTED"):
+        s = globals().get(name)
+        if isinstance(s, Iterable):
+            protected_names.update(str(n).lower() for n in s)
+
+    if not protected_names:
+        return False  # ingenting å sjekke mot
+
+    p = node
+    while p is not None:
+        tag_name = getattr(p, "name", None)
+        if tag_name and tag_name.lower() in protected_names:
+            return True
+        p = getattr(p, "parent", None)
+
+    return False
+
 # --- end ust used several times ------------------------------------------------------
-
-def _in_protected_context(node):
-    p = node
-    while p is not None:
-        if getattr(p, "name", "").lower() in _PROTECTED:
-            return True
-        p = p.parent
-    return False
-
-def _needs_space_around(br):
-    # Sett inn én space hvis ikke det allerede er whitespace på minst én side
-    left = br.previous_sibling
-    right = br.next_sibling
-    left_ws = isinstance(left, NavigableString) and left and left[-1].isspace()
-    right_ws = isinstance(right, NavigableString) and right and right[:1].isspace()
-    return not (left_ws or right_ws)
-
-# --- Hjelpere for §2.1.11 ------------------------------------------------------
-
-
-def _in_protected(node):
-    p = node
-    while p is not None:
-        if getattr(p, "name", "").lower() in _PROTECTED:
-            return True
-        p = p.parent
-    return False
 
 def _prev_non_ws(n):
     s = n.previous_sibling
@@ -1515,14 +1512,6 @@ def _collapse_adjacent_brs(parent):
     return changed
 
 # --- Hjelpere for §2.1.12 ------------------------------------------------------
-
-def _in_protected(node):
-    p = node
-    while p is not None:
-        if getattr(p, "name", "") and getattr(p, "name", "").lower() in _PROTECTED:
-            return True
-        p = p.parent
-    return False
 
 def _collect_tokens(soup):
     total_tokens = 0
@@ -1811,14 +1800,6 @@ def _is_junk_alt(alt: str, src: str) -> bool:
 
 # --- Hjelpere for §2.3.1 ------------------------------------------------------
 
-def _in_protected(node):
-    p = node
-    while p is not None:
-        if getattr(p, "name", "") and getattr(p, "name", "").lower() in PROTECTED:
-            return True
-        p = p.parent
-    return False
-
 def _stem_from_src(src: str) -> str:
     try:
         path = urlparse(src).path or src
@@ -2051,14 +2032,6 @@ def _next_significant_sibling(node):
     return sib
 
 # --- Hjelpere for §2.3.4 ------------------------------------------------------
-
-def _in_protected(node):
-    p = node
-    while p is not None:
-        if getattr(p, "name", "") in _PROTECTED:
-            return True
-        p = p.parent
-    return False
 
 # --- Hjelpere for §2.3.5 ------------------------------------------------------
 
@@ -2660,14 +2633,6 @@ def _alpha_start(ol) -> int:
         return 1
 
 # --- Hjelpere for §2.4.2 ------------------------------------------------------
-
-def _in_protected(node):
-    p = node
-    while p is not None:
-        if getattr(p, "name", None) and p.name.lower() in _PROTECTED_ANCESTORS:
-            return True
-        p = getattr(p, "parent", None)
-    return False
 
 def _strip_text_bullet_prefix_inplace(li) -> bool:
     """Fjern kuletegn i starten av LI når de ligger som ren tekst. Returnerer True hvis noe ble fjernet."""
@@ -8980,6 +8945,14 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
     fixed_br   = 0
     kept_br    = 0
 
+    def _in_protected_context(node):
+        p = node
+        while p is not None:
+            if getattr(p, "name", "").lower() in _PROTECTED:
+                return True
+            p = p.parent
+        return False
+
     # 1) <hr> – fjern, unntatt beskyttede kontekster (burde ikke finnes der uansett)
     for hr in list(soup.find_all("hr")):
         if _in_protected_context(hr):
@@ -8995,7 +8968,6 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
         in_list_context = False
         p = br.parent
         while p is not None:
-            nm = getattr(p, "name", "").lower()
             if getattr(p, "name", "").lower() in ("li", "dt", "dd"):
                 in_list_context = True
                 break
@@ -9016,7 +8988,14 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
             continue
 
         # utenfor lister: erstatt med space hvis nødvendig, ellers fjern
-        if _needs_space_around(br):
+        needs_space_around = False
+        left = br.previous_sibling
+        right = br.next_sibling
+        left_ws = isinstance(left, NavigableString) and left and left[-1].isspace()
+        right_ws = isinstance(right, NavigableString) and right and right[:1].isspace()
+        needs_space_around = not (left_ws or right_ws)
+
+        if needs_space_around:
             br.replace_with(NavigableString(" "))
         else:
             br.decompose()
