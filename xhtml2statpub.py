@@ -997,19 +997,6 @@ def _is_glossary_container(tag):
         return True
     return tag.find("dl") is not None
 
-def _iter_chapter_like_containers(soup):
-    # 2.1.2
-    # Prøv først kapitler/sectioner – fall tilbake til <body>
-    candidates = []
-    for sec in soup.find_all(["section", "article"]):
-        cls = " ".join(sec.get("class", [])).lower()
-        r = (sec.get("role") or "").lower()
-        if any(k in cls for k in ("chapter", "kapittel", "kapittel", "del")) or r in ("doc-chapter", "chapter"):
-            candidates.append(sec)
-    if not candidates and soup.body:
-        candidates = [soup.body]
-    return candidates or [soup]  # nød-tilfelle
-
 def _is_acronym(tok: str) -> bool:
     # 2.1.3
     return bool(_ACRONYM_RX.match(tok)) or bool(_ROMAN_RX.match(tok))
@@ -1126,87 +1113,6 @@ def _leftmost_text_node(tag):
             return node
     return None
 
-# --- end ust used several times ------------------------------------------------------
-
-def _has_em_or_strong_ancestor(node) -> bool:
-    # 2.1.6.3
-    p = getattr(node, "parent", None)
-    while p is not None:
-        if getattr(p, "name", "").lower() in ("em","strong"):
-            return True
-        p = getattr(p, "parent", None)
-    return False
-
-def _paragraph_fully_emphasized(p) -> bool:
-    # 2.1.6.3
-    """
-    'Hele avsnittet er uthevet' betyr:
-    - For hver relevante tekstnode (ikke bare whitespace/ren tegnsetting):
-      teksten ligger et sted under <em> eller <strong>.
-    - For 'innholdstagger' (img, math, table, code, …) teller de som dekket
-      bare hvis de (selv) har en em/strong-forfader.
-    """
-    # tekst-noder
-    s = str(node)
-    is_ignorable_text_node = True if not s or not s.strip() else bool(_PUNCT_ONLY_RX.match(s))
-    for t in p.find_all(string=True):
-        if is_ignorable_text_node:
-            continue
-        if not _has_em_or_strong_ancestor(t):
-            return False
-
-    # innholdstagger
-    for el in p.find_all(_CONTENT_TAGS):
-        # tomme 'sup/sub/abbr' uten tekst behandles via tekst-noder;
-        # men for sikkerhets skyld krever vi at også disse ligger under em/strong
-        if not _has_em_or_strong_ancestor(el):
-            return False
-
-    return True
-
-# --- Hjelpere for §2.1.6.7 ------------------------------------------------------
-
-def _is_figcaption_like(el) -> bool:
-    # 2.1.6.7
-    if not getattr(el, "name", None):
-        return False
-    nm = el.name.lower()
-    if nm == "figcaption":
-        return True
-    role = (el.get("role") or "").lower()
-    if role in ("doc-caption", "figure-caption"):
-        return True
-    epubtype = (el.get("epub:type") or "").lower()
-    if "caption" in epubtype:
-        return True
-    return False
-
-def _is_figure_text_extract(el) -> bool:
-    # 2.1.6.7
-    if not getattr(el, "name", None):
-        return False
-    cls = " ".join(el.get("class", []) or []).strip()
-    if cls and _FIGTEXT_CLASS_RX.search(cls):
-        return True
-    # enkelte produksjoner bruker data-attributter
-    data_type = (el.get("data-type") or "").lower()
-    if data_type in ("fig-desc", "figure-desc", "figure-text", "image-text"):
-        return True
-    return False
-
-# --- Hjelpere for §2.1.7 ------------------------------------------------------
-
-def _has_skipped_ancestor(node) -> bool:
-    # 2.1.7
-    p = getattr(node, "parent", None)
-    while p is not None:
-        if getattr(p, "name", "").lower() in _SKIP_ANCESTORS:
-            return True
-        p = getattr(p, "parent", None)
-    return False
-
-# --- Hjelpere for §2.1.7 ------------------------------------------------------
-
 def _is_toc_container(el) -> bool:
     # 2.1.7
     if not getattr(el, "name", None):
@@ -1224,19 +1130,6 @@ def _is_toc_container(el) -> bool:
     if "toc" in cls:
         return True
     return False
-
-def _iter_toc_containers(soup):
-    # 2.1.7
-    # finn alle plausible TOC-bokser (nav/section/aside/div)
-    containers = []
-    for el in soup.find_all(True):
-        if _is_toc_container(el):
-            containers.append(el)
-    return containers
-
-# --- tekstnormalisering --------------------------------------------------------
-
-
 
 def _normalize_caps_sentence_style(text: str) -> str:
     """
@@ -1260,8 +1153,6 @@ def _normalize_caps_sentence_style(text: str) -> str:
                     tok = tok.lower()
         out.append(tok)
     return "".join(out)
-
-# --- listestruktur og konvertering --------------------------------------------
 
 def _ensure_list_container(soup, toc_box):
     """
@@ -1330,15 +1221,6 @@ def _ensure_list_container(soup, toc_box):
     toc_box.append(ol)
     return ol, True
 
-# --- per-linje (li) normalisering ---------------------------------------------
-
-def _is_page_token(tok: str) -> bool:
-    tok = tok.strip()
-    if not tok:
-        return False
-    # tall, romertall (enkelt), ev. sidebokstaver som 'A12' forekommer sjeldent – vi støtter tall/roman.
-    return tok.isdigit() or bool(_ROMAN_SIMPLE_RX.match(tok))
-
 def _normalize_toc_li(soup, li):
     """
     Sørg for: <li><a href="#..."><span class="lic">Tittel </span> <span class="lic">9</span></a></li>
@@ -1392,7 +1274,8 @@ def _normalize_toc_li(soup, li):
         last = tokens[-1]
         # stripp ledere fra siste token først
         last_clean = _LEADERS_RX.sub("", last).strip()
-        if _is_page_token(last_clean):
+
+        if (t := last_clean.strip()) and (t.isdigit() or bool(_ROMAN_SIMPLE_RX.match(t))):
             page = last_clean
             title = " ".join(tokens[:-1]).strip()
         else:
@@ -1413,27 +1296,6 @@ def _normalize_toc_li(soup, li):
     a.append(s2)
 
     return True
-
-# --- Hjelpere for §2.1.8.1 ------------------------------------------------------
-
-def _is_toc_container(el) -> bool:
-    if not getattr(el, "name", None):
-        return False
-    et = (el.get("epub:type") or "").lower()
-    if "toc" in et:
-        return True
-    role = (el.get("role") or "").lower()
-    if role == "doc-toc":
-        return True
-    el_id = (el.get("id") or "").lower()
-    if el_id in {"toc", "table-of-contents", "contents"}:
-        return True
-    cls = " ".join(el.get("class", [])).lower()
-    if "toc" in cls:
-        return True
-    return False
-
-
 
 def _ensure_single_space_between_spans(a_tag):
     """
@@ -1477,20 +1339,18 @@ def _ensure_single_space_between_spans(a_tag):
 
     return changed
 
-# --- Hjelpere for §2.1.8.2 ------------------------------------------------------
-
 def _iter_chapter_like_containers(soup):
-    # Finn kapitler via epub:type / role / klasse / fallback til body
+    # 2.1.2
+    # Prøv først kapitler/sectioner – fall tilbake til <body>
     candidates = []
     for sec in soup.find_all(["section", "article"]):
         cls = " ".join(sec.get("class", [])).lower()
         r = (sec.get("role") or "").lower()
-        et = (sec.get("epub:type") or "").lower()
-        if ("chapter" in et) or (r in ("doc-chapter", "chapter")) or ("chapter" in cls) or ("kapittel" in cls):
+        if any(k in cls for k in ("chapter", "kapittel", "kapittel", "del")) or r in ("doc-chapter", "chapter"):
             candidates.append(sec)
     if not candidates and soup.body:
         candidates = [soup.body]
-    return candidates
+    return candidates or [soup]  # nød-tilfelle
 
 def _href_fragment(a):
     href = (a.get("href") or "").strip()
@@ -1504,67 +1364,12 @@ def _anchor_in_container(container, frag_id):
     target = container.find(id=frag_id)
     return target is not None
 
-def _looks_like_chapter_toc(list_el, container, max_scan=8, min_items=2, ratio=0.6):
-    """
-    Heuristikk: en UL/OL nær kapittelstart hvor flertallet av lenkene peker til ankere i samme kapittel.
-    """
-    # må ligge tidlig i kapitlet (før 'max_scan' blokkbarn som ikke er whitespace)
-    idx = 0
-    for child in container.children:
-        if not getattr(child, "name", None):
-            continue
-        if child is list_el:
-            break
-        idx += 1
-        if idx > max_scan:
-            return False
-
-    links = list_el.find_all("a", href=True)
-    if len(links) < min_items:
-        return False
-
-    in_count = 0
-    for a in links:
-        frag = _href_fragment(a)
-        if frag and _anchor_in_container(container, frag):
-            in_count += 1
-
-    return (in_count / max(1, len(links))) >= ratio
-
-def _table_to_chapter_ol(soup, table):
-    """
-    Konverter enkel kapittel-TOC-tabell til <ol>. Henter <a> om mulig.
-    Ingen sidetall-spans her.
-    """
-    ol = soup.new_tag("ol", **{"class": "list-type-none"})
-    ol["style"] = "list-style-type: none;"
-    for tr in table.find_all("tr"):
-        cells = tr.find_all(["td", "th"])
-        if not cells:
-            continue
-        # label = alt tekst i raden uten siste celle-‘page’ (i kapittel-TOC er det sjelden sidefelt uansett)
-        label = " ".join(c.get_text(" ", strip=True) for c in cells).strip()
-        a = tr.find("a", href=True)
-        li = soup.new_tag("li")
-        link = soup.new_tag("a")
-        if a and a.get("href"):
-            link["href"] = a["href"]
-        link.string = label
-        li.append(link)
-        ol.append(li)
-    return ol
-
-# --- Hjelpere for §2.1.9.1 ------------------------------------------------------
-
-# --- deteksjon av indeks / register / bakstoff --------------------------------
-
-
 def _is_backmatter_container(el) -> bool:
     et = (el.get("epub:type") or "").lower()
     if "backmatter" in et:
         return True
     role = (el.get("role") or "").lower()
-    if role in ("doc-appendix", "doc-colophon", "doc-afterword"):
+    if role in ("doc-appendix", "doc-colophon", "doc-afterword", "doc-backmatter"):
         return True
     # fallback: veldig sent i dokumentet
     # (brukes bare hvis vi mangler eksplisitte markører)
@@ -1581,194 +1386,27 @@ def _is_backmatter_container(el) -> bool:
         pass
     return False
 
-def _is_index_container(el) -> bool:
-    if not getattr(el, "name", None):
-        return False
-    et = (el.get("epub:type") or "").lower()
-    if "index" in et:
-        return True
-    role = (el.get("role") or "").lower()
-    if role in ("doc-index",):
-        return True
-    el_id = (el.get("id") or "").lower()
-    if "index" in el_id or "register" in el_id:
-        return True
-    cls = " ".join(el.get("class", [])).lower()
-    if "index" in cls or "register" in cls:
-        return True
-    # overskrift rett foran/inni
-    head = el.find(re.compile(r'^h[1-6]$', re.I)) or el.find_previous(re.compile(r'^h[1-6]$', re.I))
-    if head and _INDEX_HEAD_RX.match(head.get_text(" ", strip=True)):
-        return True
-    return False
-
-# --- konverter tabell → liste -------------------------------------------------
-
-def _table_to_index_list(soup, table):
+def _epub_types(el) -> set[str]:
     """
-    Konverterer <table> i en indeks til <ol class="list-type-none" style="list-style-type: none;">.
-    Hver rad -> ett <li> som inneholder cellenes DOM-innhold i rekkefølge.
-    Bevarer lenker/markup; skiller celler med enkeltmellomrom.
+    Returner alle epub:type-verdier som et sett med små bokstaver.
+
+    - Tåler at el ikke er en Tag (da returneres tomt sett)
+    - Manglende eller tom epub:type gir tomt sett
+    - Splitt på mellomrom, semikolon og komma
     """
-    ol = soup.new_tag("ol", **{"class": "list-type-none"})
-    ol["style"] = "list-style-type: none;"
+    if not isinstance(el, Tag):
+        return set()
 
-    for tr in table.find_all("tr"):
-        cells = tr.find_all(["td", "th"], recursive=False)
-        if not cells:
-            continue
-        li = soup.new_tag("li")
-        first = True
-        for cell in cells:
-            if not first:
-                li.append(NavigableString(" "))
-            first = False
-            # flytt cellens barn (bevar markup)
-            for n in list(cell.contents):
-                li.append(n.extract())
-        ol.append(li)
+    raw = (el.get("epub:type") or "").strip().lower()
+    if not raw:
+        return set()
 
-    table.replace_with(ol)
-    return ol
-
-# --- fjern bildekrediteringer i bakstoffet ------------------------------------
-
-def _remove_image_credits_in_backmatter(soup, logger):
-    """
-    Fjerner 'image/picture/photo/illustration credits' i bakstoff.
-    Konservativ: krever backmatter OG treff på tydelig krediterings-overskrift,
-    og fjerner seksjonen (heading + nærmeste liste/avsnitt) behørig.
-    """
-    removed = 0
-    # Kandidater: seksjoner/div/aside i backmatter
-    for box in soup.find_all(["section", "div", "aside"]):
-        if not _is_backmatter_container(box):
-            continue
-        # Finn heading inni boksen
-        head = box.find(re.compile(r'^h[1-6]$', re.I))
-        if not head:
-            continue
-        title = head.get_text(" ", strip=True)
-        if not _IMAGE_CREDITS_HEAD_RX.match(title):
-            continue
-
-        logger.info(f'2.1.9.1 - Removing image credits section: "{title}"')
-        box.decompose()
-        removed += 1
-
-    # I enkelte bøker ligger kreditter som en løs liste med klasse/id
-    for lst in soup.find_all(["ul", "ol"]):
-        cls = " ".join(lst.get("class", [])).lower()
-        el_id = (lst.get("id") or "").lower()
-        if any(k in cls for k in ("image-credits", "illustration-credits", "picture-credits")) \
-           or any(k in el_id for k in ("image-credits", "illustration-credits", "picture-credits")):
-            if _is_backmatter_container(lst):
-                logger.info('2.1.9.1 - Removing image credits list (class/id match near end).')
-                lst.decompose()
-                removed += 1
-
-    if removed:
-        pass
-        logger.info(f"2.1.9.1 - Removed {removed} image credits section(s).")
-    return removed
-
-# --- Hjelpere for §2.1.9.1 ------------------------------------------------------
-
-
-
-def _epub_types(el):
-    t = (el.get("epub:type") or "").lower()
-    # flere typer kan stå på samme attributt (space-separert)
-    return set(t.split())
+    # Splitt på whitespace, semikolon og komma, og fjern tomme tokens
+    return {t for t in re.split(r"[\s;,]+", raw) if t}
 
 def _get_heading_text(el):
     h = el.find(re.compile(r'^h[1-6]$', re.I)) or el.find_previous(re.compile(r'^h[1-6]$', re.I))
     return (h.get_text(" ", strip=True) if h else "").strip()
-
-def _is_backmatter_container(el) -> bool:
-    et = (el.get("epub:type") or "").lower()
-    if "backmatter" in et:
-        return True
-    role = (el.get("role") or "").lower()
-    return role in {"doc-appendix","doc-colophon","doc-afterword","doc-backmatter"}
-
-def _find_backmatters(soup):
-    return [el for el in soup.find_all(True) if _is_backmatter_container(el)]
-
-def _classify_section(el, llm=None, logger=None):
-    """
-    Returnerer 'task' | 'answer' | 'reference' | 'other'
-    """
-    types = _epub_types(el)
-    title = _get_heading_text(el)
-
-    # 1) epub:type-basert
-    if types & TASK_TYPES:
-        return "task"
-    if types & ANSWER_TYPES:
-        return "answer"
-    if types & REF_TYPES:
-        return "reference"
-
-    # 2) overskrift-basert
-    if title:
-        if TASK_HEAD_RX.search(title):
-            return "task"
-        if ANSWER_HEAD_RX.search(title):
-            return "answer"
-        if REF_HEAD_RX.search(title):
-            return "reference"
-
-    # 3) valgfri LLM for uklart tilfelle
-    if llm and getattr(llm, "available", False):
-        try:
-            excerpt = el.get_text(" ", strip=True)[:800]
-            resp = llm._rpc({
-                "action": "classify_backmatter_section",
-                "title": title,
-                "epub_type": list(types),
-                "excerpt": excerpt
-            })
-            label = str(resp.get("label","other")).lower()
-            if label in {"task","answer","reference","other"}:
-                return label
-        except Exception as e:
-            if logger: logger.warning(f"2.1.9.2 - LLM unavailable ({e}); continuing without it.")
-
-    return "other"
-
-def _find_prev_chapter(el):
-    return el.find_previous(lambda x:
-        getattr(x, "name", None) and (
-            "chapter" in (x.get("epub:type") or "").lower()
-            or "chapter" in " ".join(x.get("class", [])).lower()
-            or (x.get("role") or "").lower() in ("doc-chapter","chapter")
-        )
-    )
-
-def _move_out_of_backmatter(section, backmatter, logger):
-    """
-    Flytt seksjon til forrige kapittel om mulig, ellers legg den rett før backmatter.
-    Marker for idempotens med data-attributt.
-    """
-    if section.get("data-moved-from-backmatter") == "true":
-        return False
-
-    target = _find_prev_chapter(backmatter)
-    section.extract()
-    if target is not None:
-        target.append(section)
-        where = "previous chapter"
-    else:
-        backmatter.insert_before(section)
-        where = "before backmatter"
-    section["data-moved-from-backmatter"] = "true"
-    title = _get_heading_text(section)
-    logger.info(f'2.1.9.2 - Moved task section "{title or section.name}" to {where}.')
-    return True
-
-# --- Hjelpere for §2.1.10 ------------------------------------------------------
-
 
 def _css_path(el):
     parts = []
@@ -1786,62 +1424,11 @@ def _text_lines(el):
     txt = el.get_text("\n", strip=True)
     return [ln.strip() for ln in re.split(r'\n+', txt) if ln.strip()]
 
-def _looks_like_unmarked_list_p(p):
-    lines = _text_lines(p)
-    if len(lines) < 2: return False
-    hits = sum(1 for ln in lines if LIST_LEADER_RX.match(ln))
-    return hits >= max(2, len(lines)//2)
-
-def _looks_like_poem_block(el):
-    # ≥3 korte linjer, ikke dominert av listeprefiks
-    lines = _text_lines(el)
-    if len(lines) < 3: return False
-    if sum(len(x) <= 60 for x in lines) / len(lines) < 0.7: return False
-    if sum(1 for ln in lines if LIST_LEADER_RX.match(ln)) > 0: return False
-    # mange <br> er ofte signal
-    brs = len(el.find_all("br"))
-    return brs >= 2
-
-def _looks_like_unmarked_blockquote(el):
-    # tekst som ser sitert ut, men ikke inne i <blockquote>
-    if el.find_parent("blockquote"): return False
-    t = el.get_text(" ", strip=True)
-    if not t or len(t) < 12: return False
-    return bool(QUOTE_BORDER_RX.match(t)) or any(k in " ".join(el.get("class", [])).lower()
-                                                 for k in ("quote","sitat","citat"))
-
-def _is_layout_table(tbl):
-    # Tabell uten <th>, ofte mange rader/kolonner, presentasjon/width-styling
-    if tbl.find("th"): return False
-    role = (tbl.get("role") or "").lower()
-    if role in ("presentation","none"): return True
-    has_style = bool(SUSPECT_STYLE_RX.search(tbl.get("style") or "")) or any(
-        any(attr in (el.get("style") or "").lower() for attr in ("width", "position", "float"))
-        for el in tbl.find_all(True)
-    )
-    many_rows = len(tbl.find_all("tr")) >= 3 and len(tbl.find_all("td")) >= 6
-    return has_style or many_rows
-
-def _has_suspect_inline_style(el):
-    s = (el.get("style") or "")
-    return bool(SUSPECT_STYLE_RX.search(s))
-
 def _snippet(el, n=140):
     t = el.get_text(" ", strip=True)
     return (t[:n] + "…") if len(t) > n else t
 
-# --- Hjelpere for §2.1.11 ------------------------------------------------------
-
-
-def _in_list_context(node):
-    # Tillat <br> hvis den ligger i <li>/<dt>/<dd> (uansett om det er ol/ul/dl)
-    p = node.parent
-    while p is not None:
-        nm = getattr(p, "name", "").lower()
-        if nm in ("li", "dt", "dd"):
-            return True
-        p = p.parent
-    return False
+# --- end ust used several times ------------------------------------------------------
 
 def _in_protected_context(node):
     p = node
@@ -1936,17 +1523,6 @@ def _in_protected(node):
             return True
         p = p.parent
     return False
-
-def _css_path(el):
-    parts = []
-    cur = el
-    while getattr(cur, "name", None):
-        ident = cur.name
-        if cur.get("id"): ident += f"#{cur.get('id')}"
-        if cur.get("class"): ident += "." + ".".join(cur.get("class"))
-        parts.append(ident)
-        cur = cur.parent
-    return " > ".join(reversed(parts))
 
 def _collect_tokens(soup):
     total_tokens = 0
@@ -2051,10 +1627,6 @@ def _flatten_redundant_sections(soup, logger):
 
 # --- Konfig / hjelpesett ------------------------------------------------------
 # --- Hjelpere -----------------------------------------------------------------
-
-def _epub_types(el):
-    t = (el.get("epub:type") or "").lower()
-    return set(t.split()) if t else set()
 
 def _is_task_item(el):
     return bool(_epub_types(el) & TASK_ITEM_TYPES)
@@ -2489,10 +2061,6 @@ def _in_protected(node):
     return False
 
 # --- Hjelpere for §2.3.5 ------------------------------------------------------
-
-def _epub_types(el):
-    t = (el.get("epub:type") or "").lower()
-    return set(t.split()) if t else set()
 
 def _is_heading(el):
     return bool(_HEADING_RX.match(getattr(el, "name", "") or ""))
@@ -3556,10 +3124,6 @@ def _task_title_for_lang(lang: str) -> str:
     # nb/no/annet
     return "Oppgaver"
 
-def _epub_types(el: Tag) -> set[str]:
-    raw = (el.get("epub:type") or "")
-    return {t for t in re.split(r"[\s;]+", raw.lower()) if t}
-
 def _has_heading(sec: Tag) -> bool:
     # heading som direkte barn, eller bridgehead som første nyttige node
     for c in sec.find_all(recursive=False):
@@ -3625,10 +3189,6 @@ def _task_label_for_lang(lang: str) -> str:
     if lang.startswith("nn"):
         return "Oppgåve"
     return "Oppgave"
-
-def _epub_types(el: Tag) -> set[str]:
-    raw = (el.get("epub:type") or "")
-    return {t for t in re.split(r"[\s;]+", raw.lower()) if t}
 
 def _is_answer_context(el: Tag) -> bool:
     for anc in el.parents:
@@ -3784,10 +3344,6 @@ def _task_label_for_lang(lang: str) -> str:
         return "Oppgåve"
     return "Oppgave"
 
-def _epub_types(el: Tag) -> set[str]:
-    raw = (el.get("epub:type") or "")
-    return {t for t in re.split(r"[\s;]+", raw.lower()) if t}
-
 def _is_answer_context(el: Tag) -> bool:
     for anc in el.parents:
         if getattr(anc, "name", None) == "section":
@@ -3919,10 +3475,6 @@ def _compute_alpha_letter_for_li(li: Tag) -> str | None:
 
 # --- Hjelpere for §2.5.1.3 ------------------------------------------------------
 
-def _epub_types(el: Tag) -> set[str]:
-    raw = (el.get("epub:type") or "")
-    return {t for t in re.split(r"[\s;]+", raw.lower()) if t}
-
 def _is_answer_context(el: Tag) -> bool:
     # Sjekk oppover etter section med class="key" eller epub:type ~ answer
     for anc in el.parents:
@@ -3969,10 +3521,6 @@ def _ensure_aria_labelledby(section: Tag, heading: Tag):
         section["aria-labelledby"] = hid
 
 # --- Hjelpere for §2.5.1.3 ------------------------------------------------------
-
-def _epub_types(el: Tag) -> set[str]:
-    raw = (el.get("epub:type") or "")
-    return {t for t in re.split(r"[\s;]+", raw.lower()) if t}
 
 def _in_task_context(el: Tag) -> bool:
     """Er noden inne i en task-seksjon / task-type epub:type?"""
@@ -4122,10 +3670,6 @@ def _already_replaced(img: Tag) -> bool:
 
 # --- Hjelpere for §2.5.1.6 ------------------------------------------------------
 
-def _epub_types(el: Tag) -> set[str]:
-    raw = (el.get("epub:type") or "")
-    return {t for t in re.split(r"[\s;]+", raw.lower()) if t}
-
 def _doc_lang(soup) -> str:
     html = getattr(soup, "html", None)
     if not html:
@@ -4239,10 +3783,6 @@ def _convert_table_to_two_lists(tbl: Tag, soup, lang: str, logger) -> tuple[Tag,
 # --- Hjelpere for §2.5.1.7 ------------------------------------------------------
 
 
-def _epub_types(el: Tag) -> set[str]:
-    raw = (el.get("epub:type") or "")
-    return {t for t in re.split(r"[\s;]+", raw.lower()) if t}
-
 def _in_fill_task_context(node: Tag) -> bool:
     """Er noden i en oppgave-/utfyllingskontekst?"""
     p = node
@@ -4294,10 +3834,6 @@ def _replace_p_four_dots_with_inline(p: Tag):
     p.replace_with(span)
 
 # --- Hjelpere for §2.5.1.8 ------------------------------------------------------
-
-def _epub_types(el: Tag) -> set[str]:
-    raw = (el.get("epub:type") or "")
-    return {t for t in re.split(r"[\s;]+", raw.lower()) if t}
 
 def _in_fill_blank_container(el: Tag) -> bool:
     """Er vi i relevant oppgavekontekst?"""
@@ -4409,10 +3945,6 @@ def _neutralize_answer(answer_el: Tag):
 
 # --- Hjelpere for §2.5.1.9 ------------------------------------------------------
 
-def _epub_types(el: Tag) -> set[str]:
-    raw = (el.get("epub:type") or "")
-    return {t for t in re.split(r"[\s;]+", raw.lower()) if t}
-
 def _in_task_context(el: Tag) -> bool:
     p = el
     while p is not None:
@@ -4511,10 +4043,6 @@ def _convert_2col_table_to_question_list(tbl: Tag, soup, logger) -> bool:
     return True
 
 # --- Hjelpere for §2.5.1.10 ------------------------------------------------------
-
-def _epub_types(el: Tag) -> set[str]:
-    raw = (el.get("epub:type") or "")
-    return {t for t in re.split(r"[\s;]+", raw.lower()) if t}
 
 def _doc_lang(soup) -> str:
     html = getattr(soup, "html", None)
@@ -4661,10 +4189,6 @@ def _ensure_figcaption_copied(tbl: Tag, fig: Tag):
 
 # --- Hjelpere for 2.5.1.12 ----------------------------------------------------
 
-def _epub_types(el):
-    t = (el.get("epub:type") or "").lower()
-    return set(t.split()) if t else set()
-
 def _is_task_container(el):
     if not getattr(el, "name", None):
         return False
@@ -4684,10 +4208,6 @@ def _in_task_or_key_ancestor(node):
     return False
 
 # --- Hjelpere for 2.5.1.13 ----------------------------------------------------
-
-def _epub_types(el: Tag) -> set[str]:
-    t = (el.get("epub:type") or "").lower()
-    return set(t.split()) if t else set()
 
 def _is_task_container(el: Tag) -> bool:
     if not getattr(el, "name", None): return False
@@ -4807,10 +4327,6 @@ def _by_table_rc(items: list[dict]) -> list[str]:
     return [it["text"] for it in items]
 
 # --- Hjelpere for 2.5.1.14 ----------------------------------------------------
-def _epub_types(el: Tag) -> set[str]:
-    t = (el.get("epub:type") or "").lower()
-    return set(t.split()) if t else set()
-
 def _is_task_container(el: Tag) -> bool:
     if not getattr(el, "name", None):
         return False
@@ -4875,10 +4391,6 @@ def _mk_ul_unstyled(soup):
     return ul
 
 # --- Hjelpere for 2.5.1.15 ----------------------------------------------------
-def _epub_types(el: Tag) -> set[str]:
-    t = (el.get("epub:type") or "").lower()
-    return set(t.replace(";", " ").split()) if t else set()
-
 def _is_task_container(el: Tag) -> bool:
     if not getattr(el, "name", None):
         return False
@@ -4937,10 +4449,6 @@ def _mark_list_type_none(ol: Tag):
 # --- Hjelpere for 2.5.1.16 ----------------------------------------------------
 
 # --- konfig/heuristikk --------------------------------------------------------
-
-def _epub_types(el: Tag) -> set[str]:
-    t = (el.get("epub:type") or "").lower()
-    return set(t.replace(";", " ").replace(",", " ").split()) if t else set()
 
 def _is_task_container(el: Tag) -> bool:
     if not getattr(el, "name", None): return False
@@ -5005,10 +4513,6 @@ def _insertion_anchor_inside_li(li: Tag):
     return None
 
 # --- Hjelpere for 2.5.1.17 ----------------------------------------------------
-def _epub_types(el: Tag) -> set[str]:
-    t = (el.get("epub:type") or "").lower()
-    return set(t.replace(";", " ").replace(",", " ").split()) if t else set()
-
 def _is_task_container(el: Tag) -> bool:
     if not getattr(el, "name", None): return False
     cls = set(el.get("class", []) or [])
@@ -5183,10 +4687,6 @@ def _find_numbered_p_run(anchor: Tag) -> list[Tag]:
     return []
 
 # --- Hjelpere for 2.5.1.18 ----------------------------------------------------
-def _epub_types(el: Tag) -> set[str]:
-    t = (el.get("epub:type") or "").lower()
-    return set(t.replace(";", " ").replace(",", " ").split()) if t else set()
-
 def _is_task_container(el: Tag) -> bool:
     if not getattr(el, "name", None): return False
     cls = set(el.get("class", []) or [])
@@ -5295,10 +4795,6 @@ def _make_ul_from_rows(soup, rows: list[list[str]]) -> Tag:
     return ul
 
 # --- Hjelpere for 2.5.1.19 ----------------------------------------------------
-def _epub_types(el: Tag) -> set[str]:
-    t = (el.get("epub:type") or "").lower()
-    return set(t.replace(";", " ").replace(",", " ").split()) if t else set()
-
 def _is_task_container(el: Tag) -> bool:
     if not getattr(el, "name", None): return False
     cls = set(el.get("class", []) or [])
@@ -5397,10 +4893,6 @@ def _wrap_into_paragraphs(soup, nodes: list):
     return paras
 
 # --- Hjelpere for 2.5.2 ----------------------------------------------------
-
-def _epub_types(el: Tag) -> set[str]:
-    t = (el.get("epub:type") or "").lower()
-    return set(t.replace(";", " ").replace(",", " ").split()) if t else set()
 
 def _is_task_container(el: Tag) -> bool:
     if not getattr(el, "name", None): return False
@@ -5570,10 +5062,6 @@ def _ensure_heading_in_section(sec: Tag, label: str, soup):
 
 # --- Hjelpere for 2.6 ----------------------------------------------------
 
-def _epub_types(el: Tag) -> set[str]:
-    t = (el.get("epub:type") or "").lower()
-    return set(t.replace(";", " ").replace(",", " ").split()) if t else set()
-
 def _nearest_section(node: Tag, soup) -> Tag:
     anc = node
     while anc is not None and getattr(anc, "name", None) != "section":
@@ -5685,16 +5173,6 @@ def _normalize_frame_classes(el: Tag):
 
 def _tokenize_types(val: str) -> set[str]:
     return set((val or "").lower().replace(";", " ").replace(",", " ").split())
-
-'''
-def _epub_types(el: Tag) -> set[str]:
-    return _tokenize_types(el.get("epub:type", ""))
-'''
-
-def _epub_types(el) -> set[str]:
-    if not isinstance(el, Tag):
-        return set()
-    return _tokenize_types(el.get("epub:type", ""))
 
 def _is_task_tag(tag: Tag) -> bool:
     return bool(_epub_types(tag) & _TASKISH_TOKENS)
@@ -8779,12 +8257,38 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
     logger.info("2.1.6.4 - Paragraphs in <em> or <strong>")
     changed = 0
 
+    def _has_em_or_strong_ancestor(node) -> bool:
+        # 2.1.6.3
+        p = getattr(node, "parent", None)
+        while p is not None:
+            if getattr(p, "name", "").lower() in ("em","strong"):
+                return True
+            p = getattr(p, "parent", None)
+        return False
+
     for p in soup.find_all("p"):
         # Rask sjekk: finnes det i det hele tatt em/strong i avsnittet?
         if not p.find(["em","strong"]):
             continue
 
-        if not _paragraph_fully_emphasized(p):
+        # tekst-noder
+        paragraph_fully_emphasized = True
+        s = str(node)
+        is_ignorable_text_node = True if not s or not s.strip() else bool(_PUNCT_ONLY_RX.match(s))
+        for t in p.find_all(string=True):
+            if is_ignorable_text_node:
+                continue
+            if not _has_em_or_strong_ancestor(t):
+                paragraph_fully_emphasized = False
+
+        # innholdstagger
+        for el in p.find_all(_CONTENT_TAGS):
+            # tomme 'sup/sub/abbr' uten tekst behandles via tekst-noder;
+            # men for sikkerhets skyld krever vi at også disse ligger under em/strong
+            if not _has_em_or_strong_ancestor(el):
+                paragraph_fully_emphasized = False
+
+        if not paragraph_fully_emphasized:
             continue
 
         # Unwrap alle em/strong under dette avsnittet
@@ -8841,7 +8345,13 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
     changed = 0
 
     # 1) figcaptions (og 'figcaption-like')
-    figcaps = [el for el in soup.find_all(True) if _is_figcaption_like(el)]
+    is_figcaption_like = False
+    is_figcaption_like |= el.name.lower() == "figcaption"
+    is_figcaption_like |= (el.get("role") or "").lower() in ("doc-caption", "figure-caption")
+    is_figcaption_like |= "caption" in (el.get("epub:type") or "").lower()
+    
+    figcaps = [el for el in soup.find_all(True) if is_figcaption_like]
+
     for cap in figcaps:
         targets = []
         for node in cap.find_all(["em", "strong"]):
@@ -8857,7 +8367,12 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
                 logger.info(f'2.1.6.7 - Unwrapped emphasis in figcaption: "{preview}"')
 
     # 2) tekst uttrukket fra figurer (fig-desc / figure-text / image-text)
-    figtexts = [el for el in soup.find_all(True) if _is_figure_text_extract(el)]
+    is_figure_text_extract = False
+    is_figure_text_extract |= bool((classes := " ".join(el.get("class", []) or []).strip()) and _FIGTEXT_CLASS_RX.search(classes))
+    is_figure_text_extract |= (el.get("data-type") or "").lower() in ("fig-desc", "figure-desc", "figure-text", "image-text")
+
+    figtexts = [el for el in soup.find_all(True) if is_figure_text_extract]
+
     for box in figtexts:
         targets = []
         for node in box.find_all(["em", "strong"]):
@@ -8885,19 +8400,26 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
     logger.info('2.1.7 - Non-breaking space')
 
     changed = 0
-    for text in list(soup.find_all(string=True)):
+
+    for text in list(soup(string=True)):
         if not isinstance(text, NavigableString):
             continue
-        if _has_skipped_ancestor(text):
-            continue
-        s = str(text)
-        if len(s) < 2:
+        
+        has_skipped_ancestor = False
+        p = getattr(text, "parent", None)
+
+        while p is not None:
+            if getattr(p, "name", "").lower() in _SKIP_ANCESTORS:
+                has_skipped_ancestor = True
+            p = getattr(p, "parent", None)
+
+        if has_skipped_ancestor or len(str(text)) < 2:
             continue
 
-        s2 = RE_BEFORE.sub(rf'\1{NBSP}', s)
+        s2 = RE_BEFORE.sub(rf'\1{NBSP}', str(text))
         s3 = RE_AFTER.sub(rf'{NBSP}\1', s2)
 
-        if s3 != s:
+        if s3 != str(text):
             text.replace_with(NavigableString(s3))
             changed += 1
 
@@ -8913,7 +8435,10 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
     """
     logger.info("2.1.8 - Table of contents")
 
-    containers = _iter_toc_containers(soup)
+    containers = []
+    for el in soup.find_all(True):
+        if _is_toc_container(el):
+            containers.append(el)
     if not containers:
         logger.info("2.1.8 - No TOC container found.")
     else:
@@ -9044,14 +8569,56 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
                 in_count = sum(1 for a in links if _anchor_in_container(chapter, _href_fragment(a)))
                 if in_count == 0:
                     continue
-                ol = _table_to_chapter_ol(soup, cand)
+                ol = soup.new_tag("ol", **{"class": "list-type-none"})
+                ol["style"] = "list-style-type: none;"
+                for tr in cand.find_all("tr"):
+                    cells = tr.find_all(["td", "th"])
+                    if not cells:
+                        continue
+                    label = " ".join(c.get_text(" ", strip=True) for c in cells).strip()
+                    a = tr.find("a", href=True)
+                    li = soup.new_tag("li")
+                    link = soup.new_tag("a")
+                    if a and a.get("href"):
+                        link["href"] = a["href"]
+                    link.string = label
+                    li.append(link)
+                    ol.append(li)
                 cand.replace_with(ol)
                 list_el = ol
             else:
                 list_el = cand
 
+            looks_like_chapter_toc = False
+            """
+            Heuristikk: en UL/OL nær kapittelstart hvor flertallet av lenkene peker til ankere i samme kapittel.
+            """
+            # må ligge tidlig i kapitlet (før 'max_scan' blokkbarn som ikke er whitespace)
+            max_scan=8
+            min_items=2
+            ratio=0.6
+            idx = 0
+            for child in chapter.children:
+                if not getattr(child, "name", None):
+                    continue
+                if child is list_el:
+                    break
+                idx += 1
+                if idx > max_scan:
+                    break
+            if not looks_like_chapter_toc:
+                links = list_el("a", href=True)
+                if not looks_like_chapter_toc:
+                    in_count = 0
+                    for a in links:
+                        frag = _href_fragment(a)
+                        if frag and _anchor_in_container(chapter, frag):
+                            in_count += 1
+
+                    looks_like_chapter_toc = (in_count / max(1, len(links))) >= ratio
+
             # verifiser at liste-kandidaten faktisk er en kapittel-TOC
-            if not _looks_like_chapter_toc(list_el, chapter):
+            if not looks_like_chapter_toc:
                 continue
 
             # Sørg for <ol> + styling
@@ -9097,10 +8664,67 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
     logger.info("2.1.9.1 - Indexes and registers")
 
     # 1) Fjern bildekrediteringer (konservativt)
-    _remove_image_credits_in_backmatter(soup, logger)
+    """
+    Fjerner 'image/picture/photo/illustration credits' i bakstoff.
+    Konservativ: krever backmatter OG treff på tydelig krediterings-overskrift,
+    og fjerner seksjonen (heading + nærmeste liste/avsnitt) behørig.
+    """
+    removed = 0
+    # Kandidater: seksjoner/div/aside i backmatter
+    for box in soup(["section", "div", "aside"]):
+        if not _is_backmatter_container(box):
+            continue
+        # Finn heading inni boksen
+        head = box.find(re.compile(r'^h[1-6]$', re.I))
+        if not head:
+            continue
+        title = head.get_text(" ", strip=True)
+        if not _IMAGE_CREDITS_HEAD_RX.match(title):
+            continue
+
+        logger.info(f'2.1.9.1 - Removing image credits section: "{title}"')
+        box.decompose()
+        removed += 1
+
+    # I enkelte bøker ligger kreditter som en løs liste med klasse/id
+    for lst in soup.find_all(["ul", "ol"]):
+        cls = " ".join(lst.get("class", [])).lower()
+        el_id = (lst.get("id") or "").lower()
+        if any(k in cls for k in ("image-credits", "illustration-credits", "picture-credits")) \
+           or any(k in el_id for k in ("image-credits", "illustration-credits", "picture-credits")):
+            if _is_backmatter_container(lst):
+                logger.info('2.1.9.1 - Removing image credits list (class/id match near end).')
+                lst.decompose()
+                removed += 1
+
+    if removed:
+        pass
+        logger.info(f"2.1.9.1 - Removed {removed} image credits section(s).")
 
     # 2) Finn indeks-/registercontainere og konverter tabeller til lister
     converted = 0
+
+    def _is_index_container(el) -> bool:
+        if not getattr(el, "name", None):
+            return False
+        et = (el.get("epub:type") or "").lower()
+        if "index" in et:
+            return True
+        role = (el.get("role") or "").lower()
+        if role in ("doc-index",):
+            return True
+        el_id = (el.get("id") or "").lower()
+        if "index" in el_id or "register" in el_id:
+            return True
+        cls = " ".join(el.get("class", [])).lower()
+        if "index" in cls or "register" in cls:
+            return True
+        # overskrift rett foran/inni
+        head = el.find(re.compile(r'^h[1-6]$', re.I)) or el.find_previous(re.compile(r'^h[1-6]$', re.I))
+        if head and _INDEX_HEAD_RX.match(head.get_text(" ", strip=True)):
+            return True
+        return False
+
     containers = [el for el in soup.find_all(True) if _is_index_container(el)]
     if not containers:
         logger.info("2.1.9.1 - No obvious index/register container found.")
@@ -9108,7 +8732,24 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
     for box in containers:
         # Konverter bare tabeller (idempotent; kjøring #2 finner ingen tabeller)
         for table in list(box.find_all("table")):
-            _table_to_index_list(soup, table)
+            ol = soup.new_tag("ol", **{"class": "list-type-none"})
+            ol["style"] = "list-style-type: none;"
+
+            for tr in table("tr"):
+                if (cells := tr(["td", "th"], recursive=False)):
+                    continue
+                li = soup.new_tag("li")
+                first = True
+                for cell in cells:
+                    if not first:
+                        li.append(NavigableString(" "))
+                    first = False
+                    # flytt cellens barn (bevar markup)
+                    for n in list(cell.contents):
+                        li.append(n.extract())
+                ol.append(li)
+
+            table.replace_with(ol)
             converted += 1
 
     logger.info(f"2.1.9.1 - Converted {converted} table(s) in index/register to lists.")
@@ -9125,11 +8766,76 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
     logger.info("2.1.9.2 - Answer sections for tasks")
     llm = _ensure_llm_client(logger, use_llm) if use_llm else None
 
-    backmatters = _find_backmatters(soup)
-    if not backmatters:
-        logger.info("2.1.9.2 - No backmatter container found.")
+    def _classify_section(el, llm=None, logger=None):
+        # PERF: move down
+        """
+        Returnerer 'task' | 'answer' | 'reference' | 'other'
+        """
+        types = _epub_types(el)
+        title = _get_heading_text(el)
 
-    else:
+        # 1) epub:type-basert
+        if types & TASK_TYPES:
+            return "task"
+        if types & ANSWER_TYPES:
+            return "answer"
+        if types & REF_TYPES:
+            return "reference"
+
+        # 2) overskrift-basert
+        if title:
+            if TASK_HEAD_RX.search(title):
+                return "task"
+            if ANSWER_HEAD_RX.search(title):
+                return "answer"
+            if REF_HEAD_RX.search(title):
+                return "reference"
+
+        # 3) valgfri LLM for uklart tilfelle
+        if llm and getattr(llm, "available", False):
+            try:
+                excerpt = el.get_text(" ", strip=True)[:800]
+                resp = llm._rpc({
+                    "action": "classify_backmatter_section",
+                    "title": title,
+                    "epub_type": list(types),
+                    "excerpt": excerpt
+                })
+                label = str(resp.get("label","other")).lower()
+                if label in {"task","answer","reference","other"}:
+                    return label
+            except Exception as e:
+                if logger: logger.warning(f"2.1.9.2 - LLM unavailable ({e}); continuing without it.")
+
+        return "other"
+
+    def _move_out_of_backmatter(section, backmatter, logger):
+        """
+        Flytt seksjon til forrige kapittel om mulig, ellers legg den rett før backmatter.
+        Marker for idempotens med data-attributt.
+        """
+        if section.get("data-moved-from-backmatter") == "true":
+            return False
+        target = el.find_previous(lambda x:
+                                  getattr(x, "name", None) and (
+                                      "chapter" in (x.get("epub:type") or "").lower()
+                                      or "chapter" in " ".join(x.get("class", [])).lower()
+                                      or (x.get("role") or "").lower() in ("doc-chapter","chapter")
+                                      )
+                                  )
+        section.extract()
+        if target is not None:
+            target.append(section)
+            where = "previous chapter"
+        else:
+            backmatter.insert_before(section)
+            where = "before backmatter"
+        section["data-moved-from-backmatter"] = "true"
+        title = _get_heading_text(section)
+        logger.info(f'2.1.9.2 - Moved task section "{title or section.name}" to {where}.')
+        return True
+
+    if (backmatters := [el for el in soup.find_all(True) if _is_backmatter_container(el)]) is None:
         moved, kept_answer, kept_ref, kept_other = 0, 0, 0, 0
 
         for bm in backmatters:
@@ -9156,6 +8862,9 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
             moved, kept_answer, kept_ref, kept_other
         )
 
+    else:
+        logger.info("2.1.9.2 - No backmatter container found.")
+
     # 2.1.10 Layout challenges
     """
     2.1.10 Layout challenges: flagg mistenkelige layouter for manuell avklaring.
@@ -9172,9 +8881,25 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
         # hopp tydelige semantikker
         if el.name in ("ol","ul","li","blockquote","table","figcaption"): continue
 
-        try_list = _looks_like_unmarked_list_p(el)
-        try_poem = _looks_like_poem_block(el)
-        try_quote = _looks_like_unmarked_blockquote(el)
+        try_list = False
+        lines = _text_lines(el)
+        if not len(lines) < 2:
+            hits = sum(1 for ln in lines if LIST_LEADER_RX.match(ln))
+            try_list |= hits >= max(2, len(lines)//2)
+
+        try_poem = False
+        lines = _text_lines(el)
+        if not len(lines) < 3:
+            if not sum(len(x) <= 60 for x in lines) / len(lines) < 0.7:
+                if not sum(1 for ln in lines if LIST_LEADER_RX.match(ln)) > 0:
+                    try_poem |= len(el.find_all("br")) >= 2
+
+        try_quote = False
+        if not el.find_parent("blockquote"):
+            t = el.get_text(" ", strip=True)
+            if (t := el.get_text(" ", strip=True)) and len(t) >= 12:
+                try_quote |= bool(QUOTE_BORDER_RX.match(t)) or any(k in " ".join(el.get("class", [])).lower()
+                                                                   for k in ("quote","sitat","citat"))
 
         label = None
         if use_llm and llm and (try_list or try_poem or try_quote):
@@ -9204,7 +8929,20 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
 
     # 2) Layout-tabeller
     for tbl in soup.find_all("table"):
-        if _is_layout_table(tbl):
+        is_layout_table = False
+        if not tbl.find("th"):
+            role = (tbl.get("role") or "").lower()
+            if role in ("presentation","none"):
+                is_layout_table = True
+            else:
+                has_style = bool(SUSPECT_STYLE_RX.search(tbl.get("style") or "")) or any(
+                    any(attr in (el.get("style") or "").lower() for attr in ("width", "position", "float"))
+                    for el in tbl.find_all(True)
+                )
+                many_rows = len(tbl.find_all("tr")) >= 3 and len(tbl.find_all("td")) >= 6
+                is_layout_table = has_style or many_rows
+
+        if is_layout_table:
             logger.warning('2.1.10 [LAYOUT-TABLE?] %s — rows=%d, cells=%d',
                            _css_path(tbl),
                            len(tbl.find_all("tr")),
@@ -9213,7 +8951,7 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
 
     # 3) Suspekt inline-CSS
     for el in soup.find_all(True, style=True):
-        if _has_suspect_inline_style(el):
+        if bool(SUSPECT_STYLE_RX.search((el.get("style") or ""))):
             logger.warning('2.1.10 [INLINE-CSS?] %s — style="%s"',
                            _css_path(el), (el.get("style") or "").strip()[:120])
             issues += 1
@@ -9254,7 +8992,18 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
         if _in_protected_context(br):
             continue
 
-        if _in_list_context(br):
+        in_list_context = False
+        p = br.parent
+        while p is not None:
+            nm = getattr(p, "name", "").lower()
+            if getattr(p, "name", "").lower() in ("li", "dt", "dd"):
+                in_list_context = True
+                break
+            if p == soup:
+                break
+            p = p.parent
+
+        if in_list_context:
             # i liste: la én <br> stå, men fjern duplikater på rad
             # (idempotent: kjøring #2 finner ingen flere)
             nxt = br.next_sibling
