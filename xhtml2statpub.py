@@ -1454,12 +1454,6 @@ def _in_protected(node) -> bool:
 
 # --- end ust used several times ------------------------------------------------------
 
-def _next_non_ws(n):
-    s = n.next_sibling
-    while s is not None and isinstance(s, NavigableString) and not s.strip():
-        s = s.next_sibling
-    return s
-
 def _has_alnum_text(node) -> bool:
     if isinstance(node, NavigableString):
         return bool(_ALNUM_RX.search(str(node)))
@@ -1487,7 +1481,10 @@ def _insert_br_before_if_needed(soup, anchor):
     return False
 
 def _insert_br_after_if_needed(soup, anchor):
-    nxt = _next_non_ws(anchor)
+    nxt = anchor.next_sibling
+    while nxt is not None and isinstance(nxt, NavigableString) and not nxt.strip():
+        nxt = nxt.next_sibling
+    
     if nxt is None:
         return False
     if getattr(nxt, "name", None) == "br":
