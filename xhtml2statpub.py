@@ -1452,8 +1452,6 @@ def _in_protected(node) -> bool:
 
     return False
 
-# --- end ust used several times ------------------------------------------------------
-
 def _has_alnum_text(node) -> bool:
     if isinstance(node, NavigableString):
         return bool(_ALNUM_RX.search(str(node)))
@@ -1461,8 +1459,7 @@ def _has_alnum_text(node) -> bool:
         return bool(_ALNUM_RX.search(node.get_text("", strip=True)))
     return False
 
-def _is_math(node) -> bool:
-    return getattr(node, "name", "").lower() == "math"
+# --- end ust used several times ------------------------------------------------------
 
 def _insert_br_before_if_needed(soup, anchor):
     prev = anchor.previous_sibling
@@ -1475,7 +1472,7 @@ def _insert_br_before_if_needed(soup, anchor):
     if getattr(prev, "name", None) == "br":
         return False
     # sett inn br hvis forrige er tekst med innhold eller <math>
-    if _is_math(prev) or _has_alnum_text(prev):
+    if getattr(prev, "name", "").lower() == "math" or _has_alnum_text(prev):
         anchor.insert_before(soup.new_tag("br"))
         return True
     return False
@@ -1489,7 +1486,7 @@ def _insert_br_after_if_needed(soup, anchor):
         return False
     if getattr(nxt, "name", None) == "br":
         return False
-    if _is_math(nxt) or _has_alnum_text(nxt):
+    if getattr(nxt, "name", "").lower() == "math" or _has_alnum_text(nxt):
         anchor.insert_after(soup.new_tag("br"))
         return True
     return False
