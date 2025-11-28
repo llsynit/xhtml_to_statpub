@@ -1461,20 +1461,6 @@ def _has_alnum_text(node) -> bool:
 
 # --- end ust used several times ------------------------------------------------------
 
-def _insert_br_after_if_needed(soup, anchor):
-    nxt = anchor.next_sibling
-    while nxt is not None and isinstance(nxt, NavigableString) and not nxt.strip():
-        nxt = nxt.next_sibling
-    
-    if nxt is None:
-        return False
-    if getattr(nxt, "name", None) == "br":
-        return False
-    if getattr(nxt, "name", "").lower() == "math" or _has_alnum_text(nxt):
-        anchor.insert_after(soup.new_tag("br"))
-        return True
-    return False
-
 def _collapse_adjacent_brs(parent):
     changed = 0
     for br in list(parent.find_all("br")):
@@ -8997,7 +8983,6 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
             if _in_protected(m):   # (math inni math/skript er uansett uaktuelt, men safe guard)
                 continue
 
-            insert_br_before_if_needed = False
             prev = m.previous_sibling
             # TODO: make more robust
             while prev is not None and isinstance(prev, NavigableString) and not prev.strip():
@@ -9006,12 +8991,17 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
                 not getattr(prev, "name", None) == "br" and
                 getattr(prev, "name", "").lower() == "math" or _has_alnum_text(prev)
                 ):
-                insert_br_before_if_needed = True
-    
-            # Sett inn <br> før/etter ved behov
-            if insert_br_before_if_needed:
+                m.insert_before(soup.new_tag("br"))
                 inserted += 1
-            if _insert_br_after_if_needed(soup, m):
+    
+            nxt = m.next_sibling
+            while nxt is not None and isinstance(nxt, NavigableString) and not nxt.strip():
+                nxt = nxt.next_sibling
+            if (nxt and
+                not getattr(nxt, "name", None) == "br" and
+                (getattr(nxt, "name", "").lower() == "math" or _has_alnum_text(nxt))
+                ):
+                m.insert_after(soup.new_tag("br"))
                 inserted += 1
 
             # Rydd opp doble <br> rundt denne math’en
