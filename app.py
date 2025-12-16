@@ -39,7 +39,6 @@ load_dotenv()
 # Importér selve transformasjonen
 from xhtml2statpub import convert
 
-
 # -----------------------------------------------------------------------------
 # Logger
 # -----------------------------------------------------------------------------
@@ -54,6 +53,15 @@ logger = logging.getLogger(__name__)
 
 logging.getLogger("aio_pika").setLevel(logging.WARNING)
 logging.getLogger("aiormq").setLevel(logging.WARNING)
+
+class Args:
+    def __init__(self, **kwargs):
+        # legg inn alle felter fra kwargs
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+ 
+        # legg alltid inn logger
+        self.logger = logger
 
 
 # =============================================================================
@@ -213,7 +221,7 @@ async def run(
     data = await file.read()
 
       # Bygg args-objektet (dot-notasjon) slik apply_requirements forventer
-    args = SimpleNamespace(
+    args = Args(
         input=xhtml_path,
         folders=folders,
         production_number=production_number,
@@ -226,11 +234,11 @@ async def run(
         llm=bool(llm),
         aggressive=bool(False),
         relocate=bool(relocate),
-        logger=logger,
+        #logger=logger,
     )
     logger.info(f"Args: {args}")
     try:
-        status = convert(args)
+        status = convert(args, logger)
     finally:
         try:
             os.unlink(xhtml_path)
@@ -296,7 +304,7 @@ async def _handle_work_message(m: aio_pika.IncomingMessage):
         grade = 8
         mathematics = False
         science = False
-        args = SimpleNamespace(
+        args = Args(
             input=str(tmp_xhtml),
             folders=folders,
             production_number=production_number,
@@ -314,15 +322,17 @@ async def _handle_work_message(m: aio_pika.IncomingMessage):
             llm=bool(llm),
             aggressive=bool(False),
             relocate=bool(relocate),
-            logger=logger,
+            #logger=logger,
         )
+
+        #args.logger = logger
 
         #print(f"Args: {args}")
         logger.info(f"Args: {args}")
 
         # 2) Run xhtml_to_statpub
         try:
-            status = convert(args)
+            status = convert(args, logger)
         except Exception as e:
             # crash → publish fail
             artifacts = {"error": f"xhtml_to_statpub crashed: {e}"}
@@ -381,7 +391,7 @@ async def _amqp_reconnector_loop():
         else:
             await asyncio.sleep(RECONNECT_DELAY_SECONDS)
 
-
+'''
 async def _setup_amqp_once():
     try:
         # AMQP connect
@@ -415,7 +425,85 @@ async def _setup_amqp_once():
         app.state.amqp_conn = None
         app.state.amqp_ch = None
         return False
+'''
 
+async def _setup_amqp_once() -> bool:
+    """
+    Establish AMQP connection, declare exchanges/queue, and start consuming.
+
+    Important:
+    - Must set app.state.amqp_enabled = True on success
+    - Must store consumer_tag so we can cancel on shutdown / reconnect
+    - Should avoid re-registering consumers if already enabled
+    """
+    # If we're already enabled, don't set up again (prevents duplicate consumers)
+    if getattr(app.state, "amqp_enabled", False) and getattr(app.state, "amqp_conn", None):
+        return True
+
+    try:
+        # AMQP connect
+        conn = await aio_pika.connect_robust(RABBITMQ_URL)
+        ch = await conn.channel()
+        await ch.set_qos(prefetch_count=1)
+
+        # Exchanges
+        work_ex = await ch.declare_exchange(
+            WORK_EXCHANGE,
+            aio_pika.ExchangeType.DIRECT,
+            durable=True,
+        )
+        results_ex = await ch.declare_exchange(
+            RESULTS_EXCHANGE,
+            aio_pika.ExchangeType.TOPIC,
+            durable=True,
+        )
+
+        # Queue + bind
+        q = await ch.declare_queue(WORK_QUEUE_NAME_XHTML_TO_STATPUB, durable=True)
+        await q.bind(work_ex, routing_key=WORK_ROUTING_KEY_XHTML_TO_STATPUB)
+
+        # Start consuming (store the consumer tag!)
+        consumer_tag = await q.consume(_handle_work_message, no_ack=False)
+
+        # Persist state
+        app.state.amqp_conn = conn
+        app.state.amqp_ch = ch
+        app.state.work_ex = work_ex
+        app.state.results_ex = results_ex
+        app.state.work_q = q
+        app.state.work_consumer_tag = consumer_tag
+        app.state.amqp_enabled = True
+
+        logger.info(
+            "[%s] consuming: exchange='%s' rk='%s' queue='%s'",
+            MODULE_NAME_XHTML_TO_STATPUB,
+            WORK_EXCHANGE,
+            WORK_ROUTING_KEY_XHTML_TO_STATPUB,
+            WORK_QUEUE_NAME_XHTML_TO_STATPUB,
+        )
+        return True
+
+    except (AMQPConnectionError, OSError, ConnectionRefusedError) as e:
+        logger.warning(
+            "[%s] AMQP connection failed (%s). Running without RabbitMQ. "
+            "HTTP endpoints remain available.",
+            MODULE_NAME_XHTML_TO_STATPUB, repr(e)
+        )
+
+        # Ensure disabled/clean-ish state (best effort)
+        app.state.amqp_enabled = False
+
+        # Close any partial resources if they exist
+        try:
+            if getattr(app.state, "amqp_ch", None):
+                await app.state.amqp_ch.close()
+        except Exception:
+            pass
+        try:
+            if getattr(app.state, "amqp_conn", None):
+                await app.state.amqp_conn.close()
+        except Exception:
+            pass
 
 async def _cleanup_loop():
     """
