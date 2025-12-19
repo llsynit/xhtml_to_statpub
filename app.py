@@ -520,8 +520,8 @@ async def _setup_amqp_once() -> bool:
         work_ex = await ch.declare_exchange(WORK_EXCHANGE, aio_pika.ExchangeType.DIRECT, durable=True)
         results_ex = await ch.declare_exchange(RESULTS_EXCHANGE, aio_pika.ExchangeType.TOPIC, durable=True)
 
-        q = await ch.declare_queue(WORK_QUEUE_NAME_BOK_TO_DOCX, durable=True)
-        await q.bind(work_ex, routing_key=WORK_ROUTING_KEY_BOK_TO_DOCX)
+        q = await ch.declare_queue(WORK_QUEUE_NAME_XHTML_TO_STATPUB, durable=True)
+        await q.bind(work_ex, routing_key=WORK_ROUTING_KEY_XHTML_TO_STATPUB)
 
         consumer_tag = await q.consume(_handle_work_message, no_ack=False)
 
@@ -534,12 +534,12 @@ async def _setup_amqp_once() -> bool:
         app.state.amqp_enabled = True
 
         logger.info("[%s] consuming: exchange='%s' rk='%s' queue='%s'",
-                    MODULE_NAME_BOK_TO_DOCX, WORK_EXCHANGE, WORK_ROUTING_KEY_BOK_TO_DOCX, WORK_QUEUE_NAME_BOK_TO_DOCX)
+                    MODULE_NAME_XHTML_TO_STATPUB, WORK_EXCHANGE, WORK_ROUTING_KEY_XHTML_TO_STATPUB, WORK_QUEUE_NAME_XHTML_TO_STATPUB)
         return True
 
     except (AMQPConnectionError, OSError, ConnectionRefusedError) as e:
         logger.warning("[%s] AMQP connection failed (%s). Running without RabbitMQ. HTTP endpoints remain available.",
-                       MODULE_NAME_BOK_TO_DOCX, repr(e))
+                       MODULE_NAME_XHTML_TO_STATPUB, repr(e))
         app.state.amqp_enabled = False
 
         # Lukk LOKALE ressurser (disse er de farlige lekkasjene)
