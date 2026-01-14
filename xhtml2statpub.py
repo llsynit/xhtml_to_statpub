@@ -72,7 +72,7 @@ from config import (MODULE_NAME_XHTML_TO_STATPUB, PORT_XHTML_TO_STATPUB, RABBITM
                     WORK_ROUTING_KEY_XHTML_TO_STATPUB, WORK_QUEUE_NAME_XHTML_TO_STATPUB,
                     ARTIFACTS_ROOT, ARTIFACTS_RETENTION_HOURS,
                     ARTIFACTS_CLEAN_INTERVAL_SEC,
-                    WORKER_BASE_URL)
+                    WORKER_BASE_URL_XHTML_TO_STATPUB)
 
 # VARIBLES
 # ========
@@ -7387,10 +7387,24 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
     print(f'type args in apply_requirements: {type(args)}')
     print(f'type logger in apply_requirements: {type(logger)}')
 
+    '''
     try:
         args.grade = int(args.grade)
     except:
         args.grade = 10
+    '''
+
+    if args.grade and args.grade.isdigit():
+        args.grade = int(args.grade)
+    else:
+        for keyword in soup('meta', attrs={'name':'dc:subject.keyword'}):
+            if 'content' in keyword.attrs and keyword['content'].isdigit():
+                args.grade = int(keyword['content'])
+                break
+    if not args.grade:
+        args.grade = 10  # default høyeste nivå
+
+    logger.info(f'Assumed grade level: {args.grade}')
 
     # Fix soup.html['lang'] if needed
     if 'lang' not in soup.html.attrs.keys():
@@ -8199,7 +8213,7 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
 
         # tekst-noder
         paragraph_fully_emphasized = True
-        s = str(node)
+        s = str(p)
         is_ignorable_text_node = True if not s or not s.strip() else bool(_PUNCT_ONLY_RX.match(s))
         for t in p.find_all(string=True):
             if is_ignorable_text_node:
@@ -8259,6 +8273,7 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
             logger.info(f'2.1.6.6 - Unwrapping emphasis in table heading: {emphasis}')
             emphasis.unwrap()
 
+    '''
     # 2.1.6.7 Avoid use of <em> or <strong> in figures and figcaptions
     """
     2.1.6.7: Ikke bruk <em>/<strong> i figcaptions eller tekst uttrukket fra figurer.
@@ -8270,6 +8285,7 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
 
     changed = 0
 
+    # TODO: FIX NOW!
     # 1) figcaptions (og 'figcaption-like')
     is_figcaption_like = False
     is_figcaption_like |= el.name.lower() == "figcaption"
@@ -8299,6 +8315,79 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
 
     figtexts = [el for el in soup.find_all(True) if is_figure_text_extract]
 
+    for box in figtexts:
+        targets = []
+        for node in box.find_all(["em", "strong"]):
+            if node.find_parent(_SKIP_INSIDE):
+                continue
+            targets.append(node)
+
+        for node in targets:
+            preview = (node.get_text(" ", strip=True) or "")[:60]
+            node.unwrap()
+            changed += 1
+            if preview:
+                logger.info(f'2.1.6.7 - Unwrapped emphasis in extracted figure text: "{preview}"')
+
+    logger.info(f"2.1.6.7 - Done. Removed {changed} <em>/<strong> tag(s).")
+    '''
+
+
+    """
+    2.1.6.7: Ikke bruk <em>/<strong> i figcaptions eller tekst uttrukket fra figurer.
+    - Fjerner <em>/<strong> i (1) figcaptions og (2) 'figure text' containere.
+    - Skipper <code>/<pre>/<math> osv.
+    - Idempotent.
+    """
+    logger.info("2.1.6.7 - Avoid use of <em>/<strong> in figures and figcaptions")
+
+    def _is_figcaption_like(el) -> bool:
+        if not getattr(el, "name", None):
+            return False
+        nm = el.name.lower()
+        if nm == "figcaption":
+            return True
+        role = (el.get("role") or "").lower()
+        if role in ("doc-caption", "figure-caption"):
+            return True
+        epubtype = (el.get("epub:type") or "").lower()
+        if "caption" in epubtype:
+            return True
+        return False
+
+    def _is_figure_text_extract(el) -> bool:
+        if not getattr(el, "name", None):
+            return False
+        cls = " ".join(el.get("class", []) or []).strip()
+        if cls and _FIGTEXT_CLASS_RX.search(cls):
+            return True
+        # enkelte produksjoner bruker data-attributter
+        data_type = (el.get("data-type") or "").lower()
+        if data_type in ("fig-desc", "figure-desc", "figure-text", "image-text"):
+            return True
+        return False
+
+
+    changed = 0
+
+    # 1) figcaptions (og 'figcaption-like')
+    figcaps = [el for el in soup.find_all(True) if _is_figcaption_like(el)]
+    for cap in figcaps:
+        targets = []
+        for node in cap.find_all(["em", "strong"]):
+            if node.find_parent(_SKIP_INSIDE):
+                continue
+            targets.append(node)
+
+        for node in targets:
+            preview = (node.get_text(" ", strip=True) or "")[:60]
+            node.unwrap()
+            changed += 1
+            if preview:
+                logger.info(f'2.1.6.7 - Unwrapped emphasis in figcaption: "{preview}"')
+
+    # 2) tekst uttrukket fra figurer (fig-desc / figure-text / image-text)
+    figtexts = [el for el in soup.find_all(True) if _is_figure_text_extract(el)]
     for box in figtexts:
         targets = []
         for node in box.find_all(["em", "strong"]):
@@ -13645,14 +13734,21 @@ def find_production_number(soup, args, logger):
 
 
 # def apply_requirements(soup, logger, folders, args, comic_text_rpc=None):
-def convert(args, logger):
+def convert(args):
+    logger = args.logger
     # Les fil og parse som XML/XHTML
     logger.info(f"Applying Statped Mark-up Requirements to file:::: {args.input}")
     
+    '''
     if getattr(args, "data", None):
         content = args.data
     else:
         content = Path(args.input).read_bytes()
+    '''
+
+    with open(args.input, 'rb') as f:
+        content = f.read()
+
     try:
         soup = BeautifulSoup(content, "xml")
 
@@ -13939,9 +14035,9 @@ def main():
     args.job_id = '0000'
     args.job_dir = ARTIFACTS_ROOT / args.job_id
 
-    logger = logger
+    args.logger = logger
     # Convert epub
-    convert(args, logger)
+    convert(args)
 
 
 if __name__ == '__main__':
