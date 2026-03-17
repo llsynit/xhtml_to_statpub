@@ -31,10 +31,10 @@ docker buildx create --use --name multi >/dev/null 2>&1 || docker buildx use mul
 docker buildx build \
   --platform "$PLATFORMS" \
   -t "${IMAGE}:${TAG}" \
-  -t "${IMAGE}:latest" \
+  -t "${IMAGE}:test-latest" \
   -f "$DOCKERFILE" \
   "$SCRIPT_DIR" --push
 
 echo "✅ Pushet:"
 echo "   - ${IMAGE}:${TAG}"
-echo "   - ${IMAGE}:latest"
+echo "   - ${IMAGE}:test-latest"
