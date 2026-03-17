@@ -83,6 +83,7 @@ current_job = {"status": "Idle", "step": None}
 
 @app.get("/health")
 async def health():
+    """Returns health state of container."""
     return {"health": "ok"}
 
 @app.post("/process")
@@ -176,4 +177,5 @@ async def process(file: UploadFile, config: UploadFile, file2: Optional[UploadFi
 
 @app.get("/status")
 async def status():
+    """Returns process status of container."""
     return current_job
