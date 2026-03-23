@@ -154,8 +154,16 @@ async def process(file: UploadFile, config: UploadFile, file2: Optional[UploadFi
             "timestamp": None
         })
 
+        manifest = {
+            "primary": filename,
+            "secondary": None,
+            "log": "log.json",
+            "report": None
+        }
+
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("manifest.json", json.dumps(manifest))
             for output_file in job_dir.rglob("*"):
                 if output_file.is_file():
                     zf.write(output_file, output_file.relative_to(job_dir))
