@@ -156,6 +156,44 @@ def apply_requirements(args, soup):
 
     # 2.1.6.6 Avoid use of <em> or <strong> in table headings
     args.logger.info('2.1.6.6 - Unwrapping <em> and <strong> from table headings')
+    for th in soup('th'):
+        for emphasis in th(emph_types):
+            emphasis.unwrap()
+
+    # 2.1.6.7 Avoid use of <em> or <strong> in figures and figcaptions
+    args.logger.info('2.1.6.7 - Unwrapping <em> and <strong> from figures and figcaptions')
+    for figure in soup('figure'):
+        for emphasis in figure(emph_types):
+            emphasis.unwrap()
+
+    # 2.1.7 Non-breaking space
+    args.logger.info('2.1.7 - Replacing non-breaking spaces with regular spaces')
+
+    NBSP = "\u00A0"
+    prefixes = [r"§{1,2}",r"kap\.",r"pkt\.",r"nr\.",r"s\.",r"fig\.",r"tab\.",r"vedl\.",
+        r"kl\.",r"ca\.",r"maks\.",r"min\.",r"kr",r"NOK",r"EUR",r"USD",r"GBP",r"€",r"\$",r"£",]
+    units = [r"kg",r"g",r"mg",r"m",r"cm",r"mm",r"km",r"l",r"dl",r"ml",r"°C",
+        r"°F",r"V",r"A",r"W",r"Hz",r"kHz",r"MHz",r"GHz",r"KB",r"MB",r"GB",r"TB",r"%"]
+
+    prefix_pattern = re.compile(rf"\b({'|'.join(prefixes)})\s+(?=\d)", flags=re.IGNORECASE)
+    unit_pattern = re.compile(rf"(?<=\d)\s+({'|'.join(units)})\b")
+    symbol_pattern = re.compile(r"(?:(§{1,2})|(€)|(\$)|(£))\s+(?=\d)")
+    skip_tags = {"script", "style"}
+
+    for text_node in soup.find_all(string=True):
+        parent = text_node.parent
+        if parent and parent.name in skip_tags:
+            continue
+
+        original = str(text_node)
+        updated = original
+        updated = prefix_pattern.sub(lambda m: f"{m.group(1)}{NBSP}", updated)
+        updated = symbol_pattern.sub(lambda m: f"{m.group(0).rstrip().split()[0]}{NBSP}",updated)
+        updated = unit_pattern.sub(lambda m: f"{NBSP}{m.group(1)}",updated)
+
+        if updated != original:
+            new_node = NavigableString(updated)
+            text_node.replace_with(new_node)
 
     return soup
 
