@@ -113,25 +113,25 @@ def apply_requirements(args, soup):
     args.logger.info('2.1.5 - Handling blank pages where elements have been moved (to be implemented in later steps)')
 
     # 2.1.6 Use of <em> and <strong>
-    emph_types = ['em', 'strong']
+    EMPH_TYPES = ['em', 'strong']
 
     # 2.1.6.1 Do not use double emphasis
     args.logger.info('.2.1.6.1 - Removing double emphasis (nested <em> or <strong>)')
-    for emphasis in soup(emph_types):
+    for emphasis in soup(EMPH_TYPES):
         for parent in emphasis.parents:
-            if parent.name in emph_types:
+            if parent.name in EMPH_TYPES:
                 emphasis.unwrap()
 
     # 2.1.6.2 Headings in <em> or <strong>
     args.logger.info('2.1.6.2 - Unwrapping headings from <em> or <strong>')
     for heading in soup(re.compile('^h[1-6]$')):
-        for emphasis in heading(emph_types):
+        for emphasis in heading(EMPH_TYPES):
             emphasis.unwrap()
 
     # 2.1.6.3 Use of <em> or <strong> in words and expressions
     args.logger.info('2.1.6.3 - Removing <em> and <strong> from words and expressions')
     punctuation = r'[.,;:!?()"\']'
-    for emphasis in soup(emph_types):
+    for emphasis in soup(EMPH_TYPES):
         if (emphasis.string and
                 len(emphasis.string) > 1 and
                 emphasis.string[-1] in punctuation and
@@ -151,19 +151,19 @@ def apply_requirements(args, soup):
     # 2.1.6.5 Avoid use of <em> or <strong> in description lists
     args.logger.info('2.1.6.5 - Unwrapping <em> and <strong> from description lists')
     for dl in soup('dl'):
-        for emphasis in dl(emph_types):
+        for emphasis in dl(EMPH_TYPES):
             emphasis.unwrap()
 
     # 2.1.6.6 Avoid use of <em> or <strong> in table headings
     args.logger.info('2.1.6.6 - Unwrapping <em> and <strong> from table headings')
     for th in soup('th'):
-        for emphasis in th(emph_types):
+        for emphasis in th(EMPH_TYPES):
             emphasis.unwrap()
 
     # 2.1.6.7 Avoid use of <em> or <strong> in figures and figcaptions
     args.logger.info('2.1.6.7 - Unwrapping <em> and <strong> from figures and figcaptions')
     for figure in soup('figure'):
-        for emphasis in figure(emph_types):
+        for emphasis in figure(EMPH_TYPES):
             emphasis.unwrap()
 
     # 2.1.7 Non-breaking space
@@ -194,6 +194,24 @@ def apply_requirements(args, soup):
         if updated != original:
             new_node = NavigableString(updated)
             text_node.replace_with(new_node)
+
+    # 2.1.8 Table of contents
+    args.logger.info('2.1.8 - Handling table of contents')
+
+    if (toc := soup.find('section', attrs={'epub:type': 'frontmatter toc'})):
+        for figure in toc('figure'):
+            figure.decompose()
+        for parent in toc.parents:
+            if parent.name == 'table':
+                pass # TODO: implement relocation of toc out of tables
+        # Cases are solved in 2.1.3 Uppercase text 
+        if (ol := toc.find('ol')): # TODO: improve
+            if 'list-style-type-none' not in ol.get('class', []):
+                args.logger.warning('2.1.8 - Wrong class on <ol> in table of contents')
+            if 'list-style-type: none' not in ol.get('style', '').replace(' ', '').replace(';', ';'):
+                args.logger.warning('2.1.8 - Wrong style on <ol> in table of contents')
+        else:
+            args.logger.warning('2.1.8 - No <ol> found in table of contents')
 
     return soup
 
