@@ -1144,6 +1144,7 @@ def _normalize_caps_sentence_style(text: str) -> str:
                         tok = tok.lower()
                     tok = tok[0].upper() + tok[1:]
                 else:
+                    #pass # TESTING
                     tok = tok.upper()
                 first_alpha = True
             else:
@@ -7714,84 +7715,39 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
     - Unntak: akronymer/initialismer, romertall; bevar matte/kode.
     - Valgfritt LLM (args.llm): kan returnere tokens (egennavn/brand) som skal bevares.
     """
-    logger.info("2.1.3 - Uppercase text (headings)")
+    logger.info("2.1.3 - Uppercase text ")
 
-    # Initier LLM-klient hvis ønsket
-    llm = _ensure_llm_client(logger, args.llm)
-
-    for h in soup(re.compile(r'^h[1-6]$', re.I)):
-        if any(desc.name in _SKIP_TAGS for desc in h.descendants if getattr(desc, "name", None)):
-            logger.info(f'2.1.3 - Skipping heading with math/code: "{h.get_text(strip=True)}"')
+    for node in soup(string=True):
+        if node.parent.name in ['script', 'style'] or isinstance(node, NavigableString) == False:
             continue
 
-        original_html_text = h.get_text(" ", strip=True) #_collect_heading_text(h)
+        if node.isupper() and len(node) > 2:
+            node.replace_with(node[0] + node[1:].lower())
+        else:
+            original_text = str(node)
+            '''
+            Hva denne gjør:
+            [A-ZÆØÅ]{2,}: Ser kun på ord med 2 eller flere bokstaver (ignorerer "I" og "Å").
+            Sjekken if ...:
+            not original_text[:m.start()].strip(): Sjekker om ordet er først i noden.
+            original_text[:m.start()].strip().endswith('.'): Sjekker om forrige tegn (minus mellomrom) er et punktum.
+            Resultatet:
+            Hvis en av sjekkene stemmer: Beholder første bokstav stor, resten små (f.eks. Meir, Ntnu).
+            Ellers: Hele ordet blir små bokstaver (f.eks. ntnu, lese).
+            Eksempel:
+            "MEIR Å LESE. NTNU ER BRA" → "Meir Å lese. Ntnu er bra"
+            "Sjekk NTNU" → "Sjekk ntnu"
+            '''
+            new_text = re.sub(r'\b[A-ZÆØÅ]{2,}\b',
+                lambda m: (m.group(0)[0] + m.group(0)[1:].lower())
+                if not original_text[:m.start()].strip() or original_text[:m.start()].strip().endswith('.')
+                else m.group(0).lower(),
+                original_text)
 
-        """
-        Spør LLM (hvis aktiv) om hvilke 'tokens' i headingen som bør beholde opprinnelig
-        kapitalisering (egennavn/brand). Returnerer et sett med streng-tokens.
-        """
-        if not getattr(llm, "available", False) or not original_html_text:
-            keep = set()
-        try:
-            resp = llm._rpc({  # gjenbruk RPC-klienten fra 2.1.2 hvis du har den
-                "action": "capitalization_exceptions",
-                "heading": original_html_text
-            })
-            keep = resp.get("keep", [])
-            keep = set([k for k in keep if isinstance(k, str) and k])
-        except Exception as e:
-            logger.warning(f"2.1.3 - LLM unavailable ({e}); continuing without it.")
-            keep = set()
 
-        continue
+            if new_text != original_text and node.parent:
+                node.replace_with(new_text)
 
-        # Gå gjennom alle tekst-noder så vi bevarer <em>, <span> osv.
-        first_seen = {"done": False}  # ikke nødvendig nå, vi normaliserer per tekstbit med helheten i keep-settet
-        changed_any = False
-
-        for tnode in list(h.find_all(string=True, recursive=True)):
-            """
-            Gjør heading om til setningsstil:
-            - Første alfabetiske ord: stor forbokstav (med mindre akronym/keep)
-            - Øvrige ord: lower() (med mindre akronym/keep)
-            - Bevarer mellomrom og tegnsetting.
-            """
-
-            first_done = False
-            out = []
-
-            for m in _TOK_RX.finditer(raw):
-                word, space, other = m.groups()
-                if space is not None:
-                    out.append(space)
-                    continue
-                if other is not None:
-                    out.append(other)
-                    continue
-
-                # word
-                w = word
-                if _is_acronym(w) or w in keep_tokens:
-                    out.append(w)  # behold
-                    first_done = first_done or w.isalpha()
-                    continue
-
-                # Vanlig ord
-                if not first_done:
-                    # Første ord: stor forbokstav + resten lower
-                    out.append(w[0].upper() + w[1:].lower() if len(w) > 1 else w.upper())
-                    first_done = True
-                else:
-                    out.append(w.lower())
-
-            new_txt = "".join(out)
-
-            if new_txt != str(tnode):
-                tnode.replace_with(new_txt)
-                changed_any = True
-
-        if changed_any:
-            logger.info(f'2.1.3 - Heading: "{original_html_text}" -> "{h.get_text(" ", strip=True)}"')
 
     # 2.1.5 Blank pages where elements have been moved
     # NOTE: 2.1.5 must be done before 2.1.4, because it relies on data-moved-from-seg tags
@@ -10853,14 +10809,30 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
             # Rydd: ta bort tomme wrappers
             parent = dl.parent
             dl.decompose()
-            # Fjern tom asides/divs som ble stående igjen
-            while parent and isinstance(parent, Tag):
-                if parent.name in {"aside", "div"} and not parent.find(True) and not parent.get_text("", strip=True):
-                    nxt = parent.parent
+
+            HEADINGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+
+            for parent in soup.find_all(class_="glossary"):
+                # Finn bare ekte child-tags, ignorer whitespace/tekstnoder
+                child_tags = [child for child in parent.children if isinstance(child, Tag)]
+
+                # Tekstinnhold uten whitespace
+                text_content = parent.get_text("", strip=True)
+
+                # 1. Fjern helt tomme glossary-elementer
+                if not child_tags and not text_content:
+                    print("Removing empty glossary:", parent.name, repr(text_content))
+                    print(parent)
                     parent.decompose()
-                    parent = nxt
-                else:
-                    break
+                    continue
+
+                # 2. Fjern glossary-elementer der eneste gjenværende child-tag er en overskrift
+                if len(child_tags) == 1 and child_tags[0].name in HEADINGS:
+                    print("Removing glossary with only heading:", parent.name, repr(text_content))
+                    print(parent)
+                    parent.decompose()
+                    continue
+
 
         logger.info("2.4.4.2 - Done. dl moved=%d, containers=%d, page groups=%d",
                     moved, containers_created, groups_created)
@@ -13948,7 +13920,7 @@ def main():
                         help = 'The input file')
     parser.add_argument('-o',
                         '--output',
-                        help = 'The output epub file')
+                        help = 'The output xhtml file')
     parser.add_argument('-m',
                         '--mathematics',
                         help = 'The epub is a mathematics book',
