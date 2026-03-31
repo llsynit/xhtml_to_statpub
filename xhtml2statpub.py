@@ -118,7 +118,8 @@ ARTIFACTS_ROOT = (BASE_DIR / "artifacts").resolve()
 ARTIFACTS_ROOT.mkdir(parents=True, exist_ok=True)
 
 TMP_DIR     = path.join(path.dirname(path.abspath(__file__)), 'tmp')
-STATIC_DIR  = BASE_DIR #path.join(path.dirname(path.abspath(__file__)), 'static')
+#STATIC_DIR  = BASE_DIR #path.join(path.dirname(path.abspath(__file__)), 'static')
+STATIC_DIR  = BASE_DIR / "static" 
 OUTPUT_DIR  = path.join(path.dirname(path.abspath(__file__)), 'output')
 
 PUNCTUATION = string.punctuation
