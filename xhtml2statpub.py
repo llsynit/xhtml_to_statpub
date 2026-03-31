@@ -8021,6 +8021,60 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
 
     logger.info(f"2.1.6.2 - Done. Removed {changed} <em>/<strong> tag(s) inside headings.")
 
+    # NOTE: 2.1.6.4 is placed before 2.1.6.3 because that yields a more stable processing order (full-paragraph emphasis is easier to detect and fix before we start splitting partial emphasis).
+
+    # 2.1.6.4 Paragraphs in <em> or <strong>
+    """
+    2.1.6.4: Ikke bruk <em>/<strong> for *hele* avsnitt.
+    Hvis *alt reelt innhold* i <p> ligger under em/strong, unwrap alle em/strong.
+    Idempotent og forsiktig (rører ikke delvis uthevede avsnitt).
+    """
+    logger.info("2.1.6.4 - Paragraphs in <em> or <strong>")
+    changed = 0
+
+    def _has_em_or_strong_ancestor(node) -> bool:
+        # 2.1.6.3
+        p = getattr(node, "parent", None)
+        while p is not None:
+            if getattr(p, "name", "").lower() in ("em","strong"):
+                return True
+            p = getattr(p, "parent", None)
+        return False
+
+    for p in soup.find_all("p"):
+        # Rask sjekk: finnes det i det hele tatt em/strong i avsnittet?
+        if not p.find(["em","strong"]):
+            continue
+
+        # tekst-noder
+        paragraph_fully_emphasized = True
+        s = str(p)
+        is_ignorable_text_node = True if not s or not s.strip() else bool(_PUNCT_ONLY_RX.match(s))
+        for t in p.find_all(string=True):
+            if is_ignorable_text_node:
+                continue
+            if not _has_em_or_strong_ancestor(t):
+                paragraph_fully_emphasized = False
+
+        # innholdstagger
+        for el in p.find_all(_CONTENT_TAGS):
+            # tomme 'sup/sub/abbr' uten tekst behandles via tekst-noder;
+            # men for sikkerhets skyld krever vi at også disse ligger under em/strong
+            if not _has_em_or_strong_ancestor(el):
+                paragraph_fully_emphasized = False
+
+        if not paragraph_fully_emphasized:
+            continue
+
+        # Unwrap alle em/strong under dette avsnittet
+        for ems in list(p.find_all(["em","strong"])):
+            ems.unwrap()
+        changed += 1
+        prev = (p.get_text(" ", strip=True) or "")[:60]
+        logger.info(f'2.1.6.4 - Unwrapped full-paragraph emphasis: "{prev}"')
+
+    logger.info(f"2.1.6.4 - Done. Paragraphs fixed: {changed}")
+
     # 2.1.6.3 Use of <em> or <strong> in words and expressions
     """
     2.1.6.3: Presis bruk av <em>/<strong> rundt ord/uttrykk.
@@ -8143,58 +8197,6 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
             changed_total += 1
 
     logger.info(f"2.1.6.3 - Done. Changes: {changed_total}")
-
-    # 2.1.6.4 Paragraphs in <em> or <strong>
-    """
-    2.1.6.4: Ikke bruk <em>/<strong> for *hele* avsnitt.
-    Hvis *alt reelt innhold* i <p> ligger under em/strong, unwrap alle em/strong.
-    Idempotent og forsiktig (rører ikke delvis uthevede avsnitt).
-    """
-    logger.info("2.1.6.4 - Paragraphs in <em> or <strong>")
-    changed = 0
-
-    def _has_em_or_strong_ancestor(node) -> bool:
-        # 2.1.6.3
-        p = getattr(node, "parent", None)
-        while p is not None:
-            if getattr(p, "name", "").lower() in ("em","strong"):
-                return True
-            p = getattr(p, "parent", None)
-        return False
-
-    for p in soup.find_all("p"):
-        # Rask sjekk: finnes det i det hele tatt em/strong i avsnittet?
-        if not p.find(["em","strong"]):
-            continue
-
-        # tekst-noder
-        paragraph_fully_emphasized = True
-        s = str(p)
-        is_ignorable_text_node = True if not s or not s.strip() else bool(_PUNCT_ONLY_RX.match(s))
-        for t in p.find_all(string=True):
-            if is_ignorable_text_node:
-                continue
-            if not _has_em_or_strong_ancestor(t):
-                paragraph_fully_emphasized = False
-
-        # innholdstagger
-        for el in p.find_all(_CONTENT_TAGS):
-            # tomme 'sup/sub/abbr' uten tekst behandles via tekst-noder;
-            # men for sikkerhets skyld krever vi at også disse ligger under em/strong
-            if not _has_em_or_strong_ancestor(el):
-                paragraph_fully_emphasized = False
-
-        if not paragraph_fully_emphasized:
-            continue
-
-        # Unwrap alle em/strong under dette avsnittet
-        for ems in list(p.find_all(["em","strong"])):
-            ems.unwrap()
-        changed += 1
-        prev = (p.get_text(" ", strip=True) or "")[:60]
-        logger.info(f'2.1.6.4 - Unwrapped full-paragraph emphasis: "{prev}"')
-
-    logger.info(f"2.1.6.4 - Done. Paragraphs fixed: {changed}")
 
     # 2.1.6.5 Avoid use of <em> or <strong> in description lists
     """
