@@ -7709,6 +7709,7 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
         )
 
     # 2.1.3 Uppercase text
+    # Ensure commit
     """
     2.1.3 Uppercase text (HEADINGS):
     - Ikke bruk uppercase headings; bruk initial stor bokstav og ellers små bokstaver.
