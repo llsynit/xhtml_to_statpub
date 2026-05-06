@@ -7720,7 +7720,7 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
     logger.info("2.1.3 - Uppercase text ")
 
     for node in soup(string=True):
-        if node.parent.name in ['script', 'style'] or isinstance(node, NavigableString) == False:
+        if node.parent.name in ['script', 'style', 'math'] or "math" in node.get("class", []) or isinstance(node, NavigableString) == False:
             continue
 
         if node.isupper() and len(node) > 2:
