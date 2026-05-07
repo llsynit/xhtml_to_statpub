@@ -7904,9 +7904,11 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
     emphasises = ['em', 'strong']
     for emphasis in soup(emphasises):
         if emphasis.find_parent(emphasises) and not emphasis(emphasises):
+            preview = (emphasis.get_text(" ", strip=True) or "")[:60]
             emphasis.unwrap()
             total_changes += 1
-
+            if preview:
+                logger.info(f'2.1.6.2 - Unwrapped emphasis in heading: "{preview}"')
 
     logger.info(f"2.1.6.1 - Finished. Changes applied: {total_changes}")
 
@@ -7919,20 +7921,14 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
     """
     logger.info("2.1.6.2 - Headings in <em> or <strong>")
     changed = 0
-    heads = soup(re.compile(r"^h[1-6]$", re.I))
-
-    for h in heads:
+    for h in soup(re.compile(r"^h[1-6]$", re.I)):
         # Finn alle em/strong i headingen (dyp søk), men skipp hvis de ligger inne i code/pre/math
-        targets = []
-        for node in h(["em", "strong"]):
-            if node.find_parent(_SKIP_INSIDE):
-                # Ikke rør vektmerking inne i kode/matte
-                continue
-            targets.append(node)
-
-        for node in targets:
-            preview = (node.get_text(" ", strip=True) or "")[:60]
-            node.unwrap()
+        if h.find_parent(['code', 'pre', 'math']):
+            continue
+        for emphasis in h(['em', 'strong']):
+            # Gitt 2.1.6.1 fungerer dette
+            preview = (emphasis.get_text(' ', strip=True) or '')[:60]
+            emphasis.unwrap()
             changed += 1
             if preview:
                 logger.info(f'2.1.6.2 - Unwrapped emphasis in heading: "{preview}"')
