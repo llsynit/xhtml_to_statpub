@@ -8125,9 +8125,9 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
 
     """
     2.1.7 Non-breaking space:
-    - Setter NBSP mellom symbol/forkortelse og tall (f.eks. '§ 12', 'kr 100').
-    - Setter NBSP mellom tall og enhet/valuta (f.eks. '12 kg', '25 °C', '10 %').
-    - Skipper kode/math/style/script/… og er idempotent.
+    - Erstatter vanlig mellomrom/tab med NBSP ( ) mellom symbol/forkortelse og tall (f.eks. '§ 12', 'kr 100', 'nr. 3').
+    - Erstatter vanlig mellomrom/tab med NBSP ( ) mellom tall og enhet/tegn (f.eks. '12 kg', '25 °C', '10 %').
+    - Kjøres kun på tekstnoder og skipper script/style/code/pre (m.fl.); idempotent (gir ikke dobbel NBSP).
     """
     logger.info('2.1.7 - Non-breaking space')
     changed = 0
