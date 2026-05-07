@@ -8108,136 +8108,18 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
 
     logger.info(f"2.1.6.6 - Done. Removed {changed} <em>/<strong> tag(s) inside <th>.")
 
-    '''
-    # 2.1.6.7 Avoid use of <em> or <strong> in figures and figcaptions
-    """
-    2.1.6.7: Ikke bruk <em>/<strong> i figcaptions eller tekst uttrukket fra figurer.
-    - Fjerner <em>/<strong> i (1) figcaptions og (2) 'figure text' containere.
-    - Skipper <code>/<pre>/<math> osv.
-    - Idempotent.
-    """
-    logger.info("2.1.6.7 - Avoid use of <em>/<strong> in figures and figcaptions")
-
-    changed = 0
-
-    # TODO: FIX NOW!
-    # 1) figcaptions (og 'figcaption-like')
-    is_figcaption_like = False
-    is_figcaption_like |= el.name.lower() == "figcaption"
-    is_figcaption_like |= (el.get("role") or "").lower() in ("doc-caption", "figure-caption")
-    is_figcaption_like |= "caption" in (el.get("epub:type") or "").lower()
     
-    figcaps = [el for el in soup.find_all(True) if is_figcaption_like]
-
-    for cap in figcaps:
-        targets = []
-        for node in cap.find_all(["em", "strong"]):
-            if node.find_parent(_SKIP_INSIDE):
-                continue
-            targets.append(node)
-
-        for node in targets:
-            preview = (node.get_text(" ", strip=True) or "")[:60]
-            node.unwrap()
-            changed += 1
-            if preview:
-                logger.info(f'2.1.6.7 - Unwrapped emphasis in figcaption: "{preview}"')
-
-    # 2) tekst uttrukket fra figurer (fig-desc / figure-text / image-text)
-    is_figure_text_extract = False
-    is_figure_text_extract |= bool((classes := " ".join(el.get("class", []) or []).strip()) and _FIGTEXT_CLASS_RX.search(classes))
-    is_figure_text_extract |= (el.get("data-type") or "").lower() in ("fig-desc", "figure-desc", "figure-text", "image-text")
-
-    figtexts = [el for el in soup.find_all(True) if is_figure_text_extract]
-
-    for box in figtexts:
-        targets = []
-        for node in box.find_all(["em", "strong"]):
-            if node.find_parent(_SKIP_INSIDE):
-                continue
-            targets.append(node)
-
-        for node in targets:
-            preview = (node.get_text(" ", strip=True) or "")[:60]
-            node.unwrap()
-            changed += 1
-            if preview:
-                logger.info(f'2.1.6.7 - Unwrapped emphasis in extracted figure text: "{preview}"')
-
-    logger.info(f"2.1.6.7 - Done. Removed {changed} <em>/<strong> tag(s).")
-    '''
-
-
-    """
-    2.1.6.7: Ikke bruk <em>/<strong> i figcaptions eller tekst uttrukket fra figurer.
-    - Fjerner <em>/<strong> i (1) figcaptions og (2) 'figure text' containere.
-    - Skipper <code>/<pre>/<math> osv.
-    - Idempotent.
-    """
+    # 2.1.6.7 Avoid use of <em> or <strong> in figures and figcaptions
     logger.info("2.1.6.7 - Avoid use of <em>/<strong> in figures and figcaptions")
-
-    def _is_figcaption_like(el) -> bool:
-        if not getattr(el, "name", None):
-            return False
-        nm = el.name.lower()
-        if nm == "figcaption":
-            return True
-        role = (el.get("role") or "").lower()
-        if role in ("doc-caption", "figure-caption"):
-            return True
-        epubtype = (el.get("epub:type") or "").lower()
-        if "caption" in epubtype:
-            return True
-        return False
-
-    def _is_figure_text_extract(el) -> bool:
-        if not getattr(el, "name", None):
-            return False
-        cls = " ".join(el.get("class", []) or []).strip()
-        if cls and _FIGTEXT_CLASS_RX.search(cls):
-            return True
-        # enkelte produksjoner bruker data-attributter
-        data_type = (el.get("data-type") or "").lower()
-        if data_type in ("fig-desc", "figure-desc", "figure-text", "image-text"):
-            return True
-        return False
-
-
     changed = 0
-
-    # 1) figcaptions (og 'figcaption-like')
-    figcaps = [el for el in soup.find_all(True) if _is_figcaption_like(el)]
-    for cap in figcaps:
-        targets = []
-        for node in cap.find_all(["em", "strong"]):
-            if node.find_parent(_SKIP_INSIDE):
-                continue
-            targets.append(node)
-
-        for node in targets:
-            preview = (node.get_text(" ", strip=True) or "")[:60]
-            node.unwrap()
+    for emphasis in soup(['em','strong']):
+        if emphasis.find_parent(['figure','figcaption']):
+            logger.info(f'2.1.6.7 - Unwrapping emphasis in figure or figcaption: {emphasis}')
+            emphasis.unwrap()
             changed += 1
-            if preview:
-                logger.info(f'2.1.6.7 - Unwrapped emphasis in figcaption: "{preview}"')
 
-    # 2) tekst uttrukket fra figurer (fig-desc / figure-text / image-text)
-    figtexts = [el for el in soup.find_all(True) if _is_figure_text_extract(el)]
-    for box in figtexts:
-        targets = []
-        for node in box.find_all(["em", "strong"]):
-            if node.find_parent(_SKIP_INSIDE):
-                continue
-            targets.append(node)
+    logger.info(f"2.1.6.7 - Done. Removed {changed} <em>/<strong> tag(s) inside figures and figcaptions.")
 
-        for node in targets:
-            preview = (node.get_text(" ", strip=True) or "")[:60]
-            node.unwrap()
-            changed += 1
-            if preview:
-                logger.info(f'2.1.6.7 - Unwrapped emphasis in extracted figure text: "{preview}"')
-
-    logger.info(f"2.1.6.7 - Done. Removed {changed} <em>/<strong> tag(s).")
 
     # 2.1.7 Non-breaking space
 
