@@ -8099,10 +8099,14 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
     
     # 2.1.6.6 Avoid use of <em> or <strong> in table headings
     logger.info('2.1.6.6 Avoid use of <em> or <strong> in table headings')
+    changed = 0
     for th in soup('th'):
         for emphasis in th(['em', 'strong']):
             logger.info(f'2.1.6.6 - Unwrapping emphasis in table heading: {emphasis}')
             emphasis.unwrap()
+            changed += 1
+
+    logger.info(f"2.1.6.6 - Done. Removed {changed} <em>/<strong> tag(s) inside <th>.")
 
     '''
     # 2.1.6.7 Avoid use of <em> or <strong> in figures and figcaptions
