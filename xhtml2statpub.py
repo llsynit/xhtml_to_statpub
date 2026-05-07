@@ -7946,6 +7946,17 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
     logger.info("2.1.6.4 - Paragraphs in <em> or <strong>")
     changed = 0
 
+    for emphasis in soup(['em','strong']):
+        if emphasis.parent.name == 'p' and len(list(emphasis.parent.children)) == 1:
+            preview = (emphasis.get_text(' ', strip=True) or '')[:60]
+            emphasis.unwrap()
+            changed += 1
+            if preview:
+                logger.info(f'2.1.6.4 - Unwrapped emphasis covering entire paragraph: "{preview}"')
+    
+    logger.info(f"2.1.6.4 - Done. Paragraphs fixed: {changed}")
+
+    '''
     def _has_em_or_strong_ancestor(node) -> bool:
         # 2.1.6.3
         p = getattr(node, "parent", None)
@@ -7987,7 +7998,7 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
         prev = (p.get_text(" ", strip=True) or "")[:60]
         logger.info(f'2.1.6.4 - Unwrapped full-paragraph emphasis: "{prev}"')
 
-    logger.info(f"2.1.6.4 - Done. Paragraphs fixed: {changed}")
+    '''
 
     # 2.1.6.3 Use of <em> or <strong> in words and expressions
     """
@@ -13685,8 +13696,9 @@ def convert(args):
     #save to file
     rmtree(args.job_dir, ignore_errors=True)
     makedirs(args.job_dir, exist_ok=True)
-    with open(args.job_dir / f"{args.production_number}.xhtml", "wb") as f:
-        f.write(soup.prettify(formatter="minimal").encode("utf-8"))
+    with open(args.job_dir / f"{args.production_number}.xhtml", "w") as f:
+        #f.write(soup.prettify(formatter="minimal").encode("utf-8"))
+        f.write(str(soup))
     status = "success" # ?
     message = "Fil er konvertert fra xhtml til xhtml med Statped Mark-up Requirements."
     return {"status": status, "message": message}
