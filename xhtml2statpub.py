@@ -7900,97 +7900,13 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
     # 2.1.6 Use of <em> and <strong>
 
     # 2.1.6.1 Do not use double emphasis
-    """
-    2.1.6.1: Fjern dobbel vektlegging:
-    - Område under både <em> og <strong> skal ha KUN <strong>.
-    - Rene <em>-områder skal bestå.
-    - Idempotent.
-    """
-    logger.info("2.1.6.1 - Do not use double emphasis")
-
-    changed = True
     total_changes = 0
+    emphasises = ['em', 'strong']
+    for emphasis in soup(emphasises):
+        if emphasis.find_parent(emphasises) and not emphasis(emphasises):
+            emphasis.unwrap()
+            total_changes += 1
 
-    while changed:
-        changed = False
-
-        # 1) Enkel case: <strong> inne i <em> (på en eller annen dybde) -> splitt em rundt strong
-        #    Start med innerste <strong> for stabil splitting
-        for s in soup('strong'):
-            # Har s en em-ancestor?
-            if s.find_parent("em"):
-                """
-                strong er (potensielt dypt) inni en <em>.
-                Vi løfter strong ut av nærmeste <em> slik at overlapp forsvinner:
-                <em>[left] <... strong ...> [right]</em>  ->  <em>[left]</em><strong>...</strong><em>[right]</em>
-                """
-                em = strong.find_parent("em")
-                if not em:
-                    continue
-
-                # Finn nærmeste direkte barn av em som bærer strong i seg
-                carrier = strong
-                while carrier.parent is not em:
-                    carrier = carrier.parent
-
-                # del em.contents i left / carrier / right
-                left_nodes, right_nodes = [], []
-                seen = False
-                for node in list(em.contents):  # snapshot
-                    if node is carrier:
-                        seen = True
-                        continue
-                    if not seen:
-                        left_nodes.append(node)
-                    else:
-                        right_nodes.append(node)
-
-                # bygg <em> for venstre og høyre deler (kun hvis ikke tomt)
-                if left_nodes:
-                    left_em = soup.new_tag("em")
-                    for n in left_nodes:
-                        left_em.append(n.extract())
-                    em.insert_before(left_em)
-
-                # flytt carrier (som kan være et span/div/... med strong inni) ut
-                em.insert_before(carrier.extract())
-
-                if right_nodes:
-                    right_em = soup.new_tag("em")
-                    for n in right_nodes:
-                        right_em.append(n.extract())
-                    em.insert_before(right_em)
-
-                # rydde opp: em blir nå tom -> fjern
-                em.decompose()
-
-                logger.info("2.1.6.1 - Split <em> around <strong> to drop overlap")
-                total_changes += 1
-                changed = True
-
-        # 2) Motsatt: <em> inne i <strong> (overlappet del skal være strong)
-        #    Her er det trygt å fjerne <em> som er under en <strong>-ancestor
-        for em in list(soup.find_all("em")):
-            if em.find_parent("strong"):
-                em.unwrap()
-                logger.info("2.1.6.1 - Unwrapped <em> under <strong> (overlap -> strong only)")
-                total_changes += 1
-                changed = True
-
-        # 3) Rydd opp trivielle ting (nestede like tagger, tomme)
-        total_changes += _unwrap_nested_same_tags(soup, "em")
-        total_changes += _unwrap_nested_same_tags(soup, "strong")
-        removed = 0
-        for nm in ("em", "strong"):
-            for t in list(soup.find_all(nm)):
-                # tom hvis ingen innhold eller kun whitespace
-                if not t.contents or all(
-                    isinstance(c, NavigableString) and not str(c).strip()
-                    for c in t.contents
-                ):
-                    t.decompose()
-                    removed += 1
-        total_changes += removed 
 
     logger.info(f"2.1.6.1 - Finished. Changes applied: {total_changes}")
 
