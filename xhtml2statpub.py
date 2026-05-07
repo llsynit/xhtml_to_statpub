@@ -8136,7 +8136,8 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
     RE_PARA = re.compile(r"§[ \t]+(?=\d)")
 
     # 2) Valutasymbol/forkortelse + tall  -> "kr 100" => "kr 100"
-    RE_CURRENCY = re.compile(r"(?:\bkr\b|€|$|£)[ \t]+(?=\d)")
+    #RE_CURRENCY = re.compile(r"(?:\bkr\b|€|$|£)[ \t]+(?=\d)")
+    RE_CURRENCY = re.compile(r"(?<!\w)(?:kr|€|$|£)[ \t]+(?=\d)")
 
     # 3) Forkortelser + tall -> "nr. 3" => "nr. 3"
     RE_ABBR = re.compile(r"(?:\bnr.|\bpkt.|\bfig.|\btab.)[ \t]+(?=\d)")
