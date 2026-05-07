@@ -8130,30 +8130,43 @@ def apply_requirements(args, logger, soup, folders, comic_text_rpc=None):
     - Skipper kode/math/style/script/… og er idempotent.
     """
     logger.info('2.1.7 - Non-breaking space')
-
     changed = 0
+
+    # 1) § + tall  ->  "§ 12" => "§ 12"
+    RE_PARA = re.compile(r"§[ \t]+(?=\d)")
+
+    # 2) Valutasymbol/forkortelse + tall  -> "kr 100" => "kr 100"
+    RE_CURRENCY = re.compile(r"(?:\bkr\b|€|$|£)[ \t]+(?=\d)")
+
+    # 3) Forkortelser + tall -> "nr. 3" => "nr. 3"
+    RE_ABBR = re.compile(r"(?:\bnr.|\bpkt.|\bfig.|\btab.)[ \t]+(?=\d)")
+
+    # 4) Tall + enhet -> "10 kg" => "10 kg"
+    UNITS = r"(?:kg|g|mg|t|cm|mm|m|km|%|‰|MB|GB|kB|KiB|MiB|GiB|°C|°F|m²|km²|m³|l|dl|ml|s|min|h)\b"
+    RE_UNIT = re.compile(rf"(?<=\d)[ \t]+(?={UNITS})")
+
+    def fix_nbsp(s: str) -> str:
+        s = RE_PARA.sub("§ ", s)
+        s = RE_CURRENCY.sub(lambda m: m.group(0).rstrip() + " ", s)  # bevarer symbolet/forkortelsen
+        s = RE_ABBR.sub(lambda m: m.group(0).rstrip() + " ", s)
+        s = RE_UNIT.sub(" ", s)
+        return s
 
     for text in list(soup(string=True)):
         if not isinstance(text, NavigableString):
             continue
-        
-        has_skipped_ancestor = False
-        p = getattr(text, "parent", None)
 
-        while p is not None:
-            if getattr(p, "name", "").lower() in _SKIP_ANCESTORS:
-                has_skipped_ancestor = True
-            p = getattr(p, "parent", None)
-
-        if has_skipped_ancestor or len(str(text)) < 2:
+        # Hopp over ting du typisk ikke vil endre:
+        parent = getattr(text, "parent", None)
+        if parent and parent.name in ("script", "style", "code", "pre"):
             continue
 
-        s2 = RE_BEFORE.sub(rf'\1{NBSP}', str(text))
-        s3 = RE_AFTER.sub(rf'{NBSP}\1', s2)
+        old = str(text)
+        new = fix_nbsp(old)
 
-        if s3 != str(text):
-            text.replace_with(NavigableString(s3))
-            changed += 1
+        if new != old:
+            logger.info(f'2.1.7 - replacing string "{old}" with new string: "{new}"')
+            text.replace_with(new) 
 
     logger.info(f"2.1.7 - Done. Updated {changed} text node(s).")
 
